@@ -1,463 +1,91 @@
-import ibm_db
-import re
-from django.conf import settings
-
-# ========== NORMALIZE STRING FUNCTION - MUST BE AT TOP ==========
-def normalize_string(value, max_length=None):
-    """Normalize string values for DB operations"""
-    if value is None:
-        return ''
-    if not isinstance(value, str):
-        value = str(value)
-    value = value.strip()
-    if max_length is not None and len(value) > max_length:
-        return value[:max_length]
-    return value
-# ================================================================
-
-def get_db_connection():
-    conn_str = f"DATABASE={settings.DATABASES['default']['NAME']};"
-    conn_str += f"HOSTNAME={settings.DATABASES['default']['HOST']};"
-    conn_str += f"PORT={settings.DATABASES['default']['PORT']};"
-    conn_str += f"PROTOCOL=TCPIP;"
-    conn_str += f"UID={settings.DATABASES['default']['USER']};"
-    conn_str += f"PWD={settings.DATABASES['default']['PASSWORD']};"
-    
-    return ibm_db.connect(conn_str, '', '')
-
-
-def fetch_customer_data(production_order_code, production_demand_code):
-    query = """
-    SELECT PDS.PRODUCTIONDEMANDCOMPANYCODE as CompanyCode,
-           SOLN.EXTERNALREFERENCE as CustomerPO,
-           OP.CUSTOMERSUPPLIERCODE as CustomerCode,
-           BP.LEGALNAME1 as CustomerName,
-           PDS.PRODUCTIONDEMANDCOUNTERCODE as CounterCode,
-           PDS.PRODUCTIONDEMANDCODE as DemandCode,
-           PDS.PRODUCTIONORDERCODE as ProductionOrderCode,
-           SO.CODE as SalesOrderCode,
-           PD.SUBCODE01,
-           PD.SUBCODE02,
-           PD.SUBCODE03,
-           PD.SUBCODE04,
-           PD.SUBCODE05
-    FROM PRODUCTIONDEMANDSTEP PDS 
-    LEFT OUTER JOIN PRODUCTIONDEMAND PD 
-           ON PDS.PRODUCTIONDEMANDCOMPANYCODE = PD.COMPANYCODE
-          AND PDS.PRODUCTIONDEMANDCOUNTERCODE = PD.COUNTERCODE 
-          AND PDS.PRODUCTIONDEMANDCODE = PD.CODE 
-    LEFT OUTER JOIN SALESORDERLINE SOLN 
-           ON PD.ORIGDLVSALORDLINESALORDCNTCOD = SOLN.SALESORDERCOUNTERCODE 
-          AND PD.ORIGDLVSALORDLINESALORDERCODE = SOLN.SALESORDERCODE
-          AND PD.COMPANYCODE = SOLN.SALESORDERCOMPANYCODE
-          AND PD.ORIGDLVSALORDERLINEORDERLINE = SOLN.ORDERLINE 
-          AND PD.ORIGDLVSALORDLINEORDERSUBLINE = SOLN.ORDERSUBLINE 
-          AND PD.ORIGDLVSALORDLINECMPORDERLINE = SOLN.COMPONENTORDERLINE 
-    LEFT OUTER JOIN SALESORDER SO 
-           ON SOLN.SALESORDERCOMPANYCODE = SO.COMPANYCODE
-          AND SOLN.SALESORDERCOUNTERCODE = SO.COUNTERCODE 
-          AND SOLN.SALESORDERCODE = SO.CODE
-    LEFT OUTER JOIN ORDERPARTNER OP 
-           ON SO.COMPANYCODE = OP.CUSTOMERSUPPLIERCOMPANYCODE 
-          AND SO.ORDERTYPE = OP.CUSTOMERSUPPLIERTYPE
-          AND SO.ORDPRNCUSTOMERSUPPLIERCODE = OP.CUSTOMERSUPPLIERCODE 
-    LEFT OUTER JOIN BUSINESSPARTNER BP 
-           ON OP.ORDERBUSINESSPARTNERNUMBERID = BP.NUMBERID
-    WHERE PDS.PRODUCTIONORDERCODE = ?
-      AND PDS.PRODUCTIONDEMANDCODE = ?
+def fetch_kit_elements(code, pallet_number, box_number=None):
     """
+    Fetch kit elements from SKP_UPLOAD table
+    """
+    print(f"[KIT QUERY] Fetching kit elements")
+    print(f"[KIT QUERY] Code: {code}")
+    print(f"[KIT QUERY] Palette: {pallet_number}")
     
     try:
-        conn = get_db_connection()
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, production_order_code)
-        ibm_db.bind_param(stmt, 2, production_demand_code)
-        ibm_db.execute(stmt)
-        
-        result = ibm_db.fetch_assoc(stmt)
-        
-        if not result:
-            return None
-            
-        normalized_result = {
-            'CompanyCode': result.get('COMPANYCODE'),
-            'CustomerPO': result.get('CUSTOMERPO'),
-            'CustomerCode': result.get('CUSTOMERCODE'),
-            'CustomerName': result.get('CUSTOMERNAME'),
-            'CounterCode': result.get('COUNTERCODE'),
-            'DemandCode': result.get('DEMANDCODE'),
-            'ProductionOrderCode': result.get('PRODUCTIONORDERCODE'),
-            'SalesOrderCode': result.get('SALESORDERCODE'),
-            'Subcode01': result.get('SUBCODE01'),
-            'Subcode02': result.get('SUBCODE02'),
-            'Subcode03': result.get('SUBCODE03'),
-            'Subcode04': result.get('SUBCODE04'),
-            'Subcode05': result.get('SUBCODE05'),
-            'ItemType': result.get('ITEMTYPEAFICODE', '')
-        }
-        
-        print("Normalized Result:", normalized_result)
-        return normalized_result
-        
-    except Exception as e:
-        print("Database error:", e)
-        return None
-    finally:
-        if 'conn' in locals():
-            ibm_db.close(conn)
-
-
-def fetch_product_details(production_order_code, production_demand_code):
-    query = """
-    SELECT 
-        PD.ITEMTYPEAFICODE as ItemType,
-        PD.SUBCODE01,
-        PD.SUBCODE02,
-        PD.SUBCODE03,
-        PD.SUBCODE04,
-        PD.SUBCODE05,
-        PD.SUBCODE06,
-        PD.SUBCODE07,
-        PD.SUBCODE08,
-        PD.SUBCODE09,
-        PD.SUBCODE10
-    FROM PRODUCTIONDEMANDSTEP PDS
-    JOIN PRODUCTIONDEMAND PD 
-        ON PDS.PRODUCTIONDEMANDCOMPANYCODE = PD.COMPANYCODE
-       AND PDS.PRODUCTIONDEMANDCOUNTERCODE = PD.COUNTERCODE 
-       AND PDS.PRODUCTIONDEMANDCODE = PD.CODE
-    WHERE PDS.PRODUCTIONORDERCODE = ?
-      AND PDS.PRODUCTIONDEMANDCODE = ?
-    """
-    
-    print("\n[PRODUCT QUERY] Executing product details query")
-    print(f"[PRODUCT QUERY] Order: {production_order_code}, Demand: {production_demand_code}")
-
-    try:
-        conn = get_db_connection()
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, production_order_code)
-        ibm_db.bind_param(stmt, 2, production_demand_code)
-        ibm_db.execute(stmt)
-        
-        result = ibm_db.fetch_assoc(stmt)
-        print(f"[PRODUCT RESULT] Raw DB result: {result}")
-        
-        if not result:
-            print("[PRODUCT RESULT] No results returned from query")
-            return None
-            
-        item_type = result.get('ITEMTYPEAFICODE') or result.get('ITEMTYPE')
-        if item_type is None:
-            item_type = 'Not Available'
-
-        normalized_result = {
-            'ItemType': item_type.strip() if item_type else 'Not Available',
-            'Subcode01': result.get('SUBCODE01', 'N/A'),
-            'Subcode02': result.get('SUBCODE02', 'N/A'),
-            'Subcode03': result.get('SUBCODE03', 'N/A'),
-            'Subcode04': result.get('SUBCODE04', 'N/A'),
-            'Subcode05': result.get('SUBCODE05', 'N/A'),
-            'Subcode06': result.get('SUBCODE06', 'N/A'),
-            'Subcode07': result.get('SUBCODE07', 'N/A'),
-            'Subcode08': result.get('SUBCODE08', 'N/A'),
-            'Subcode09': result.get('SUBCODE09', 'N/A'),
-            'Subcode10': result.get('SUBCODE10', 'N/A')
-        }
-        
-        print(f"[PRODUCT RESULT] Normalized result: {normalized_result}")
-        return normalized_result
-        
-    except Exception as e:
-        print(f"[PRODUCT ERROR] Database error: {str(e)}")
-        return None
-    finally:
-        if 'conn' in locals():
-            ibm_db.close(conn)
-
-
-def fetch_kit_elements(production_order_code, production_demand_code, pallet_number=None, box_number=None):
-    """
-    Fetch kit elements from SKP_KITUPLOAD
-    Auto-detects box_number if not provided
-    """
-    conn = None
-    try:
-        conn = get_db_connection()
-        
-        print(f"[KIT QUERY] Fetching kit elements")
-        print(f"[KIT QUERY] Order: {production_order_code}, Demand: {production_demand_code}")
-        print(f"[KIT QUERY] Pallet: {pallet_number}, Box: {box_number}")
-        
-        # 🔥 AUTO-DETECT BOX NUMBER IF NOT PROVIDED OR BOX=1
-        if not box_number or box_number == '1' or box_number == '':
+        # Agar box_number nahi diya toh pehle fetch karo
+        if box_number is None:
             box_sql = """
-                SELECT DISTINCT BOXNUMBER 
-                FROM SKP_KITUPLOAD
-                WHERE PRODUCTIONORDERCODE = ?
-                  AND PRODUCTIONDEMANDCODE = ?
-                  AND PALLETNUMBER = ?
-                ORDER BY CAST(BOXNUMBER AS INTEGER)
+            SELECT DISTINCT BOXNUMBER
+            FROM SKP_UPLOAD
+            WHERE CODE = ?
+            AND PALLETNUMBER = ?
+            ORDER BY BOXNUMBER
             """
-            box_stmt = ibm_db.prepare(conn, box_sql)
-            ibm_db.bind_param(box_stmt, 1, normalize_string(production_order_code, 10))
-            ibm_db.bind_param(box_stmt, 2, normalize_string(production_demand_code, 10))
-            ibm_db.bind_param(box_stmt, 3, normalize_string(pallet_number or '1', 100))
-            ibm_db.execute(box_stmt)
             
-            box_numbers = []
-            row = ibm_db.fetch_assoc(box_stmt)
-            while row:
-                box_num = row.get('BOXNUMBER')
-                if box_num:
-                    box_numbers.append(str(box_num).strip())
-                row = ibm_db.fetch_assoc(box_stmt)
+            cursor.execute(box_sql, (code, pallet_number))
+            box_results = cursor.fetchall()
             
-            print(f"[KIT QUERY] Found box numbers: {box_numbers}")
-            
-            if not box_numbers:
-                print("[KIT QUERY] No box numbers found for this order")
+            if not box_results:
+                print(f"[KIT QUERY] No box numbers found for code: {code}")
                 return []
             
+            box_numbers = [row[0] for row in box_results]
+            print(f"[KIT QUERY] Found box numbers: {box_numbers}")
             box_number = box_numbers[0]
             print(f"[KIT QUERY] Using first box number: {box_number}")
         
-        # Fetch elements
+        # Fetch elements for this box
         sql = """
-            SELECT 
-                COMPANYCODE, PARTDESC, TOTALPCS, ITEMTYPECODE,
-                DECOSUBCODE01, DECOSUBCODE02, DECOSUBCODE03, DECOSUBCODE04,
-                DECOSUBCODE05, DECOSUBCODE06, DECOSUBCODE07, DECOSUBCODE08,
-                DECOSUBCODE09, DECOSUBCODE10, CODE, ELEMENTDESC, BOXNUMBER,
-                ELEMENTSEQ, FBGFABRIC, CUTTYPE, PALLETNUMBER, PAPERTUBE,
-                WEIGHTUNITOFMEASURECODE, NETWEIGHT, GROSSWEIGHT, CREATIONDATETIME,
-                CREATIONUSER, ABSUNIQUEID, BOXSEQUENCE, PACKINGSEQUENCE,
-                PLACEMENTINBOX
-            FROM SKP_KITUPLOAD
-            WHERE PRODUCTIONORDERCODE = ?
-              AND PRODUCTIONDEMANDCODE = ?
-              AND PALLETNUMBER = ?
-              AND BOXNUMBER = ?
-            ORDER BY ELEMENTSEQ
+        SELECT
+            COMPANYCODE, PARTDESC, TOTALPCS, ITEMTYPECODE,
+            DECOSUBCODE01, DECOSUBCODE02, DECOSUBCODE03, DECOSUBCODE04,
+            DECOSUBCODE05, DECOSUBCODE06, DECOSUBCODE07, DECOSUBCODE08,
+            DECOSUBCODE09, DECOSUBCODE10, CODE, ELEMENTDESC, BOXNUMBER,
+            ELEMENTSEQ, PALLETNUMBER, WEIGHTUNITOFMEASURECODE, 
+            NETWEIGHT, GROSSWEIGHT, CREATIONDATETIME, CREATIONUSER,
+            ABSUNIQUEID, BOXSEQUENCE, PACKINGSEQUENCE, PLACEMENTINBOX
+        FROM SKP_UPLOAD
+        WHERE CODE = ?
+        AND PALLETNUMBER = ?
+        AND BOXNUMBER = ?
+        ORDER BY ELEMENTSEQ
         """
         
-        stmt = ibm_db.prepare(conn, sql)
-        ibm_db.bind_param(stmt, 1, normalize_string(production_order_code, 10))
-        ibm_db.bind_param(stmt, 2, normalize_string(production_demand_code, 10))
-        ibm_db.bind_param(stmt, 3, normalize_string(pallet_number or '1', 100))
-        ibm_db.bind_param(stmt, 4, normalize_string(box_number or '1', 50))
-        ibm_db.execute(stmt)
+        cursor.execute(sql, (code, pallet_number, box_number))
+        results = cursor.fetchall()
         
-        elements = []
-        row = ibm_db.fetch_assoc(stmt)
-        while row:
-            element = {
-                'ELEMENTDESC': row.get('ELEMENTDESC', '').strip(),
-                'PACKINGSEQUENCE': row.get('PACKINGSEQUENCE', '').strip(),
-                'BOXNUMBER': row.get('BOXNUMBER', '').strip(),
-                'PALLETNUMBER': row.get('PALLETNUMBER', '').strip(),
-                'ELEMENTSEQ': row.get('ELEMENTSEQ', ''),
-                'PARTDESC': row.get('PARTDESC', '').strip(),
-                'TOTALPCS': row.get('TOTALPCS', ''),
-                'CODE': row.get('CODE', '').strip(),
-                'NETWEIGHT': row.get('NETWEIGHT', ''),
-                'GROSSWEIGHT': row.get('GROSSWEIGHT', ''),
-                'LENGHT1': row.get('LENGHT1'),
-                'LENGHT2': row.get('LENGHT2'),
-                'WIDTH1': row.get('WIDTH1'),
-                'WIDTH2': row.get('WIDTH2'),
-                'THICKNESS': row.get('THICKNESS'),
-                'ROOTSIDEANGLEA2': row.get('ROOTSIDEANGLEA2'),
-                'TIPSIDEANGLEA1': row.get('TIPSIDEANGLEA1'),
-                'TIPSIDEANGLEA2': row.get('TIPSIDEANGLEA2'),
-                'ANGLEB1': row.get('ANGLEB1'),
-                'ANGLEB2': row.get('ANGLEB2'),
-                'ROOTSIDEANGLEC1': row.get('ROOTSIDEANGLEC1'),
-                'ROOTSIDEANGLEC2': row.get('ROOTSIDEANGLEC2'),
-                'TIPSIDEANGLEC1': row.get('TIPSIDEANGLEC1'),
-                'TIPSIDEANGLEC2': row.get('TIPSIDEANGLEC2'),
-                'T1': row.get('T1'),
-                'T2': row.get('T2'),
-                'TOLLENGHT1': row.get('TOLLENGHT1'),
-                'TOLLENGHT2': row.get('TOLLENGHT2'),
-                'TOLWIDTH1': row.get('TOLWIDTH1'),
-                'TOLWIDTH2': row.get('TOLWIDTH2'),
-                'TOLTHICKNESS': row.get('TOLTHICKNESS'),
-                'TOLROOTSIDEANGLEA2': row.get('TOLROOTSIDEANGLEA2'),
-                'TOLTIPSIDEANGLEA1': row.get('TOLTIPSIDEANGLEA1'),
-                'TOLTIPSIDEANGLEA2': row.get('TOLTIPSIDEANGLEA2'),
-                'TOLANGLEB1': row.get('TOLANGLEB1'),
-                'TOLANGLEB2': row.get('TOLANGLEB2'),
-                'TOLROOTSIDEANGLEC1': row.get('TOLROOTSIDEANGLEC1'),
-                'TOLROOTSIDEANGLEC2': row.get('TOLROOTSIDEANGLEC2'),
-                'TOLTIPSIDEANGLEC1': row.get('TOLTIPSIDEANGLEC1'),
-                'TOLTIPSIDEANGLEC2': row.get('TOLTIPSIDEANGLEC2'),
-                'TOLT1': row.get('TOLT1'),
-                'TOLT2': row.get('TOLT2'),
-            }
-            elements.append(element)
-            row = ibm_db.fetch_assoc(stmt)
+        # Convert to list of dicts
+        kit_elements = []
+        for row in results:
+            kit_elements.append({
+                'companycode': row[0],
+                'partdesc': row[1],
+                'totalpcs': row[2],
+                'itemtypecode': row[3],
+                'decosubcode01': row[4],
+                'decosubcode02': row[5],
+                'decosubcode03': row[6],
+                'decosubcode04': row[7],
+                'decosubcode05': row[8],
+                'decosubcode06': row[9],
+                'decosubcode07': row[10],
+                'decosubcode08': row[11],
+                'decosubcode09': row[12],
+                'decosubcode10': row[13],
+                'code': row[14],
+                'elementdesc': row[15],
+                'boxnumber': row[16],
+                'elementseq': row[17],
+                'palletnumber': row[18],
+                'weightunit': row[19],
+                'netweight': row[20],
+                'grossweight': row[21],
+                'creationdatetime': row[22],
+                'creationuser': row[23],
+                'absuniqueid': row[24],
+                'boxsequence': row[25],
+                'packingsequence': row[26],
+                'placementinbox': row[27]
+            })
         
-        print(f"[KIT RESULT] Found {len(elements)} kit elements for box {box_number}")
-        if elements:
-            print(f"[KIT RESULT] First record PACKINGSEQUENCE: {elements[0].get('PACKINGSEQUENCE', 'N/A')}")
-            print(f"[KIT RESULT] BOXNUMBER from DB: {elements[0].get('BOXNUMBER', 'N/A')}")
-        
-        return elements
+        print(f"[KIT QUERY] Found {len(kit_elements)} kit elements")
+        return kit_elements
         
     except Exception as e:
-        print(f"[KIT ERROR] {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[KIT ERROR] {str(e)}")
         return []
-    finally:
-        if conn:
-            try:
-                ibm_db.close(conn)
-            except Exception:
-                pass
-
-
-def extract_pressur_bal_and_pl1(product_details, kit_elements=None):
-    """Extract PressurBal and PL1 values"""
-    pressur_bal = None
-    pl1 = None
-    packing_sequence = None
-    
-    print("\n[EXTRACT] Starting extraction...")
-    
-    # Extract PACKINGSEQUENCE from kit elements
-    if kit_elements and len(kit_elements) > 0:
-        print(f"[EXTRACT] Checking {len(kit_elements)} kit elements...")
-        for kit in kit_elements:
-            packing_sequence = kit.get('PACKINGSEQUENCE', '').strip()
-            if packing_sequence and packing_sequence != 'N/A':
-                print(f"[EXTRACT] Found PACKINGSEQUENCE: '{packing_sequence}'")
-                break
-    
-    # Extract PL1
-    if kit_elements and len(kit_elements) > 0:
-        for kit in kit_elements:
-            packing_seq = kit.get('PACKINGSEQUENCE', '').strip()
-            if packing_seq and packing_seq != 'N/A':
-                match = re.search(r'PL(\d+)', packing_seq.upper())
-                if match:
-                    pl1 = match.group(1)
-                    print(f"[EXTRACT] PL1 extracted from PACKINGSEQUENCE: {pl1}")
-                    break
-                elif 'PL' in packing_seq.upper():
-                    pl1 = '1'
-                    print(f"[EXTRACT] PL found (no number) from PACKINGSEQUENCE, default: {pl1}")
-                    break
-    
-    # Fallback: Extract PL1 from product details
-    if pl1 is None and product_details:
-        print("[EXTRACT] PL1 not in kit elements, checking product details...")
-        for i in range(1, 11):
-            subcode_key = f'Subcode{str(i).zfill(2)}'
-            subcode_value = product_details.get(subcode_key, '').strip()
-            if subcode_value and subcode_value != 'N/A':
-                print(f"[EXTRACT] Checking {subcode_key}: '{subcode_value}'")
-                if 'PL1' in subcode_value.upper():
-                    match = re.search(r'PL1\s*(\d+)?', subcode_value.upper())
-                    if match and match.group(1):
-                        pl1 = match.group(1)
-                    else:
-                        pl1 = '1'
-                    print(f"[EXTRACT] PL1 found in {subcode_key}: {pl1}")
-                    break
-                elif 'PL' in subcode_value.upper():
-                    match = re.search(r'PL\s*(\d+)', subcode_value.upper())
-                    if match:
-                        pl1 = match.group(1)
-                        print(f"[EXTRACT] PL found in {subcode_key}: {pl1}")
-                        break
-                elif subcode_value.isdigit() and len(subcode_value) <= 3:
-                    if pl1 is None:
-                        pl1 = subcode_value
-                        print(f"[EXTRACT] Numeric PL1 from {subcode_key}: {pl1}")
-    
-    # Extract PRESSURBAL
-    if product_details:
-        subcode03 = product_details.get('Subcode03', '').strip()
-        print(f"[EXTRACT] Checking Subcode03 for PRESSURBAL: '{subcode03}'")
-        
-        if subcode03 and subcode03 != 'N/A':
-            if 'PRESSURBAL' in subcode03.upper():
-                match = re.search(r'PRESSURBAL\s*(\d+)', subcode03.upper())
-                if match:
-                    pressur_bal = match.group(1)
-                    print(f"[EXTRACT] PRESSURBAL found in Subcode03: {pressur_bal}")
-                else:
-                    pressur_bal = subcode03
-                    print(f"[EXTRACT] Using Subcode03 as pressur_bal: {pressur_bal}")
-            else:
-                pressur_bal = subcode03
-                print(f"[EXTRACT] Using Subcode03 as pressur_bal: {pressur_bal}")
-    
-    # Fallback: Extract PRESSURBAL from other subcodes
-    if pressur_bal is None and product_details:
-        for i in range(1, 11):
-            subcode_key = f'Subcode{str(i).zfill(2)}'
-            if subcode_key != 'Subcode03':
-                subcode_value = product_details.get(subcode_key, '').strip()
-                if subcode_value and subcode_value != 'N/A':
-                    if 'PRESSURBAL' in subcode_value.upper():
-                        match = re.search(r'PRESSURBAL\s*(\d+)', subcode_value.upper())
-                        if match:
-                            pressur_bal = match.group(1)
-                            print(f"[EXTRACT] PRESSURBAL found in {subcode_key}: {pressur_bal}")
-                            break
-    
-    if pressur_bal is None:
-        pressur_bal = ''
-        print("[EXTRACT] No PRESSURBAL found; leaving blank")
-    
-    if pl1 is None:
-        pl1 = ''
-        print("[EXTRACT] No PL1 found; leaving blank")
-    
-    if not packing_sequence and pl1:
-        packing_sequence = pl1
-    
-    print(f"[EXTRACT] FINAL - PressurBal: {pressur_bal}, PL1: {pl1}, PackingSeq: {packing_sequence}\n")
-    return pressur_bal, pl1, packing_sequence
-
-
-def get_complete_product_data(production_order_code, production_demand_code, pallet_number='1', box_number=None):
-    """Fetch all product data"""
-    print("\n" + "="*60)
-    print(f"FETCHING DATA FOR Order: {production_order_code}, Demand: {production_demand_code}")
-    print("="*60)
-    
-    customer_data = fetch_customer_data(production_order_code, production_demand_code)
-    product_details = fetch_product_details(production_order_code, production_demand_code)
-    kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
-    
-    if product_details is None and customer_data:
-        product_details = {
-            'ItemType': customer_data.get('ItemType', 'Not Available'),
-            'Subcode01': customer_data.get('Subcode01', 'N/A'),
-            'Subcode02': customer_data.get('Subcode02', 'N/A'),
-            'Subcode03': customer_data.get('Subcode03', 'N/A'),
-            'Subcode04': customer_data.get('Subcode04', 'N/A'),
-            'Subcode05': customer_data.get('Subcode05', 'N/A'),
-            'Subcode06': customer_data.get('Subcode06', 'N/A'),
-            'Subcode07': customer_data.get('Subcode07', 'N/A'),
-            'Subcode08': customer_data.get('Subcode08', 'N/A'),
-            'Subcode09': customer_data.get('Subcode09', 'N/A'),
-            'Subcode10': customer_data.get('Subcode10', 'N/A')
-        }
-    
-    pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
-    
-    complete_data = {
-        'customer': customer_data,
-        'product': product_details,
-        'kit_elements': kit_elements,
-        'pressur_bal': pressur_bal,
-        'pl1': pl1,
-        'packing_sequence': packing_sequence
-    }
-    
-    return complete_data
