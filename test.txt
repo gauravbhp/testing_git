@@ -1,904 +1,908 @@
-import os
-import re
-import json
-import datetime
-import uuid
-from django.conf import settings
-from django.shortcuts import render, redirect
-from django.views.decorators.csrf import csrf_exempt
-from django.http import JsonResponse
-from .utils.db_queries import fetch_customer_data, fetch_product_details, fetch_kit_elements, fetch_tolerance_data
-from .utils.db_queries import get_db_connection, normalize_string
-from .utils.validation import validate_single_field, validate_all_fields
-from .utils.rcp_operations import (
-    get_rcp_table_name, get_table_columns, get_insert_value,
-    rcp_row_exists, insert_rcp_data, update_rcp_data, get_rcp_data,
-    process_rcp_submission
-)
-import ibm_db
+{% extends 'base.html' %}
+
+{% block content %}
+<div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-200 via-blue-100 to-purple-200 py-10 px-4">
+  <div class="w-full max-w-5xl bg-white/80 backdrop-blur-md rounded-3xl shadow-2xl border border-indigo-100 p-6 md:p-10">
+    <!-- Header Section -->
+    <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-3">
+        <div>
+            <h2 class="text-2xl md:text-3xl font-bold text-gray-800">Packing List Details</h2>
+            <p class="text-gray-600 text-sm md:text-base mt-1">Order: {{ production_order_code }} | Demand: {{ production_demand_code }}</p>
+            <p class="text-gray-600 text-sm md:text-base">Pallet: {{ pallet_number }} | Box: {{ box_number }}</p>
+        </div>
+        <a href="{% url 'fetch_data' %}" class="flex items-center bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-3 md:px-4 rounded-lg">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
+                <path fill-rule="evenodd" d="M9.707 16.707a1 1 0 01-1.414 0l-6-6a1 1 0 010-1.414l6-6a1 1 0 011.414 1.414L5.414 9H17a1 1 0 110 2H5.414l4.293 4.293a1 1 0 010 1.414z" clip-rule="evenodd" />
+            </svg>
+            Back
+        </a>
+    </div>
+
+   
+    <!-- Kit Elements Section -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+        <div class="px-4 md:px-6 py-3 md:py-4 border-b border-gray-200">
+            <h3 class="text-lg md:text-xl font-semibold text-gray-800 flex items-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 md:h-6 md:w-6 mr-2 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
+                </svg>
+                Kit Elements
+            </h3>
+        </div>
+
+        <!-- All View -->
+        <div class="p-4 md:p-6">
+            {% if kit_elements %}
+            <select class='placeholder:text-gray-400 text-gray-800 text-sm md:text-base w-full border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2.5' id="kitElementSelect" onchange="fetchElementData(this.value)">
+                <option value="">-- Select Element --</option>
+                {% for element in kit_elements %}
+                <option value="{{ element.ELEMENTDESC }}">{{ element.ELEMENTDESC }}</option>
+                {% endfor %}
+            </select>
+            {% else %}
+            <div class="rounded-lg border border-yellow-200 bg-yellow-50 px-4 py-3 text-sm text-yellow-700">
+                No kit elements were returned for this order and box selection.
+            </div>
+            {% endif %}
+
+            <div id="elementInputs" class="mt-4 flex flex-col gap-3 md:gap-4">
+                <!-- Input fields will be dynamically populated here -->
+            </div>
+        </div>
+    </div>
+</div>
 
 
-# ==================== HELPER: EXTRACT PRESSURBAL AND PL1 ====================
-def extract_pressur_bal_and_pl1(product_details, kit_elements=None):
-    """
-    Extract PressurBal and PL1 values from subcodes or kit elements
-    
-    Args:
-        product_details: Dictionary with Subcode01-10 values
-        kit_elements: List of kit element dictionaries from fetch_kit_elements()
-    
-    Returns:
-        tuple: (pressur_bal, pl1, packing_sequence)
-    """
-    pressur_bal = None
-    pl1 = None
-    packing_sequence = None
-    
-    print("\n[EXTRACT] Starting extraction...")
-    
-    # ========== EXTRACT PL1 AND PACKINGSEQUENCE FROM KIT ELEMENTS ==========
-    if kit_elements and len(kit_elements) > 0:
-        print(f"[EXTRACT] Checking {len(kit_elements)} kit elements...")
-        for kit in kit_elements:
-            # Get PACKINGSEQUENCE value
-            packing_sequence = kit.get('PACKINGSEQUENCE', '').strip()
-            if packing_sequence and packing_sequence != 'N/A':
-                print(f"[EXTRACT] Found PACKINGSEQUENCE: '{packing_sequence}'")
-                
-                # Check for PL1, PL2, PL3, etc.
-                match = re.search(r'PL(\d+)', packing_sequence.upper())
-                if match:
-                    pl1 = match.group(1)
-                    print(f"[EXTRACT] PL1 extracted from PACKINGSEQUENCE: {pl1}")
-                    break
-                elif 'PL' in packing_sequence.upper():
-                    pl1 = '1'
-                    print(f"[EXTRACT] PL found (no number) from PACKINGSEQUENCE, default: {pl1}")
-                    break
-                else:
-                    # If no PL found, use the entire packing_sequence as box identifier
-                    print(f"[EXTRACT] Using PACKINGSEQUENCE as box identifier: {packing_sequence}")
-                    break
-    
-    # ========== EXTRACT PL1 FROM PRODUCT DETAILS (Fallback) ==========
-    if pl1 is None and product_details:
-        print("[EXTRACT] PL1 not in kit elements, checking product details...")
-        
-        # Check all Subcode fields
-        for i in range(1, 11):
-            subcode_key = f'Subcode{str(i).zfill(2)}'
-            subcode_value = product_details.get(subcode_key, '').strip()
-            
-            if subcode_value and subcode_value != 'N/A':
-                print(f"[EXTRACT] Checking {subcode_key}: '{subcode_value}'")
-                
-                # Check for PL pattern
-                if 'PL1' in subcode_value.upper():
-                    match = re.search(r'PL1\s*(\d+)?', subcode_value.upper())
-                    if match and match.group(1):
-                        pl1 = match.group(1)
-                    else:
-                        pl1 = '1'
-                    print(f"[EXTRACT] PL1 found in {subcode_key}: {pl1}")
-                    break
-                elif 'PL' in subcode_value.upper():
-                    match = re.search(r'PL\s*(\d+)', subcode_value.upper())
-                    if match:
-                        pl1 = match.group(1)
-                        print(f"[EXTRACT] PL found in {subcode_key}: {pl1}")
-                        break
-                # Check for plain digits <= 3 (legacy support)
-                elif subcode_value.isdigit() and len(subcode_value) <= 3:
-                    if pl1 is None:
-                        pl1 = subcode_value
-                        print(f"[EXTRACT] Numeric PL1 from {subcode_key}: {pl1}")
-    
-    # ========== EXTRACT PRESSURBAL FROM PRODUCT DETAILS ==========
-    if product_details:
-        # Check Subcode03 first (most common location)
-        subcode03 = product_details.get('Subcode03', '').strip()
-        print(f"[EXTRACT] Checking Subcode03 for PRESSURBAL: '{subcode03}'")
-        
-        if subcode03 and subcode03 != 'N/A':
-            if 'PRESSURBAL' in subcode03.upper():
-                match = re.search(r'PRESSURBAL\s*(\d+)', subcode03.upper())
-                if match:
-                    pressur_bal = match.group(1)
-                    print(f"[EXTRACT] PRESSURBAL found in Subcode03: {pressur_bal}")
-                else:
-                    pressur_bal = subcode03
-                    print(f"[EXTRACT] Using Subcode03 as pressur_bal: {pressur_bal}")
-            else:
-                pressur_bal = subcode03
-                print(f"[EXTRACT] Using Subcode03 as pressur_bal: {pressur_bal}")
-        
-        # If not found in Subcode03, check other subcodes
-        if pressur_bal is None:
-            for i in range(1, 11):
-                subcode_key = f'Subcode{str(i).zfill(2)}'
-                if subcode_key != 'Subcode03':
-                    subcode_value = product_details.get(subcode_key, '').strip()
-                    if subcode_value and subcode_value != 'N/A':
-                        if 'PRESSURBAL' in subcode_value.upper():
-                            match = re.search(r'PRESSURBAL\s*(\d+)', subcode_value.upper())
-                            if match:
-                                pressur_bal = match.group(1)
-                                print(f"[EXTRACT] PRESSURBAL found in {subcode_key}: {pressur_bal}")
-                                break
-    
-    # ========== EXTRACT PRESSURBAL FROM KIT ELEMENTS (Fallback) ==========
-    if pressur_bal is None and kit_elements:
-        print("[EXTRACT] Checking kit elements for pressure info...")
-        for kit in kit_elements:
-            element_desc = kit.get('ELEMENTDESC', '').strip()
-            if element_desc and 'PRESSURE' in element_desc.upper():
-                match = re.search(r'(\d+)', element_desc)
-                if match:
-                    pressur_bal = match.group(1)
-                    print(f"[EXTRACT] Pressure found in ELEMENTDESC: {pressur_bal}")
-                    break
-    
-    # ========== DO NOT APPLY DEFAULTS FOR MISSING VALUES ==========
-    if pressur_bal is None:
-        pressur_bal = ''
-        print("[EXTRACT] No PRESSURBAL found; leaving blank")
+<script>
+// Global variables
+let backStream = null;
+let frontStream = null;
+let currentElementId = null;
+let currentFacingMode = 'environment';
+let isHumanCaptured = {{ has_human_image|yesno:'true,false' }};
+let humanCapturedThisSession = false;
+let frontCameraReady = false;
+let frontCameraAttempts = 0;
+let faceCaptureInProgress = false;
 
-    if pl1 is None:
-        pl1 = ''
-        print("[EXTRACT] No PL1 found; leaving blank")
+// Time tracking variables
+let captureStartTime = null;
+let backImageCaptureTime = null;
+let frontImageCaptureTime = null;
+let uploadStartTime = null;
 
-    # If no packing_sequence found, use pl1 as fallback only when pl1 is present
-    if not packing_sequence and pl1:
-        packing_sequence = pl1
-    
-    print(f"[EXTRACT] FINAL - PressurBal: {pressur_bal}, PL1: {pl1}, PackingSeq: {packing_sequence}\n")
-    return pressur_bal, pl1, packing_sequence
+// Get order info from Django template
+const orderCode = '{{ production_order_code }}';
+const demandCode = '{{ production_demand_code }}';
+const palletNumber = '{{ pallet_number }}';
+const boxNumber = '{{ box_number }}';
+const customerName = '{{ customer_data.CustomerName }}';
+const customerPO = '{{ customer_data.CustomerPO }}';
+const folderPathFromServer = '{{ folder_structure }}';
 
+// Field configuration with tolerance mapping
+const FIELD_CONFIG = [
+    { id: 'LENGHT1', label: 'LENGHT1', tolField: 'TOLLENGHT1' },
+    { id: 'LENGHT2', label: 'LENGHT2', tolField: 'TOLLENGHT2' },
+    { id: 'WIDTH1', label: 'WIDTH1', tolField: 'TOLWIDTH1' },
+    { id: 'WIDTH2', label: 'WIDTH2', tolField: 'TOLWIDTH2' },
+    { id: 'THICKNESS', label: 'THICKNESS', tolField: 'TOLTHICKNESS' },
+    { id: 'ROOTSIDEANGLEA2', label: 'ROOTSIDEANGLEA2', tolField: 'TOLROOTSIDEANGLEA2' },
+    { id: 'TIPSIDEANGLEA1', label: 'TIPSIDEANGLEA1', tolField: 'TOLTIPSIDEANGLEA1' },
+    { id: 'TIPSIDEANGLEA2', label: 'TIPSIDEANGLEA2', tolField: 'TOLTIPSIDEANGLEA2' },
+    { id: 'ANGLEB1', label: 'ANGLEB1', tolField: 'TOLANGLEB1' },
+    { id: 'ANGLEB2', label: 'ANGLEB2', tolField: 'TOLANGLEB2' },
+    { id: 'ROOTSIDEANGLEC1', label: 'ROOTSIDEANGLEC1', tolField: 'TOLROOTSIDEANGLEC1' },
+    { id: 'ROOTSIDEANGLEC2', label: 'ROOTSIDEANGLEC2', tolField: 'TOLROOTSIDEANGLEC2' },
+    { id: 'TIPSIDEANGLEC1', label: 'TIPSIDEANGLEC1', tolField: 'TOLTIPSIDEANGLEC1' },
+    { id: 'TIPSIDEANGLEC2', label: 'TIPSIDEANGLEC2', tolField: 'TOLTIPSIDEANGLEC2' },
+    { id: 'T1', label: 'T1', tolField: 'TOLT1' },
+    { id: 'T2', label: 'T2', tolField: 'TOLT2' }
+];
 
-# ==================== FETCH KITUPLOAD DATA ====================
-def fetch_kitupload_baseline_data(element_desc, order_code, demand_code, pallet_number, box_number):
-    """Fetch baseline values from SKP_KITUPLOAD for an element."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        query = """
-            SELECT
-                LENGHT1, LENGHT2, WIDTH1, WIDTH2, THICKNESS,
-                ROOTSIDEANGLEA2, TIPSIDEANGLEA1, TIPSIDEANGLEA2,
-                ANGLEB1, ANGLEB2, ROOTSIDEANGLEC1, ROOTSIDEANGLEC2,
-                TIPSIDEANGLEC1, TIPSIDEANGLEC2, T1, T2
-            FROM SKP_KITUPLOAD
-            WHERE ELEMENTDESC = ?
-              AND PALLETNUMBER = ?
-              AND BOXNUMBER = ?
-        """
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, normalize_string(element_desc, 100))
-        ibm_db.bind_param(stmt, 2, normalize_string(pallet_number or '', 100))
-        ibm_db.bind_param(stmt, 3, normalize_string(box_number or '', 50))
-        ibm_db.execute(stmt)
+// Field data storage
+let elementData = {};
+let baselineData = {};
+let toleranceData = {};
 
-        row = ibm_db.fetch_assoc(stmt)
-        if not row:
-            return None
+console.log("elementData =", elementData);
+console.log("baselineData =", baselineData);
+console.log("toleranceData =", toleranceData);
 
-        baseline_data = {}
-        fields = [
-            'LENGHT1', 'LENGHT2', 'WIDTH1', 'WIDTH2', 'THICKNESS',
-            'ROOTSIDEANGLEA2', 'TIPSIDEANGLEA1', 'TIPSIDEANGLEA2',
-            'ANGLEB1', 'ANGLEB2', 'ROOTSIDEANGLEC1', 'ROOTSIDEANGLEC2',
-            'TIPSIDEANGLEC1', 'TIPSIDEANGLEC2', 'T1', 'T2'
-        ]
+// Fetch element data when select changes
+function fetchElementData(elementId) {
+    if (!elementId) {
+        document.getElementById('elementInputs').innerHTML = '';
+        return;
+    }
 
-        for field in fields:
-            value = row.get(field)
-            if value is None:
-                value = row.get(field.upper())
-            if value is None:
-                value = row.get(field.lower())
-            if value is not None and isinstance(value, str) and value.strip() == '':
-                value = None
-            baseline_data[field] = value
+    // Show loading state
+    document.getElementById('elementInputs').innerHTML = '<div class="text-center py-4">Loading...</div>';
 
-        return baseline_data
-    except Exception as exc:
-        print(f"Error fetching RCP baseline data: {exc}")
-        return None
-    finally:
-        if conn is not None:
-            try:
-                ibm_db.close(conn)
-            except Exception:
-                pass
-
-
-def fetch_kitupload_tolerance_data(element_desc, order_code, demand_code, pallet_number, box_number):
-    """Fetch tolerance values from SKP_KITUPLOAD for an element."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        query = """
-            SELECT
-                TOLLENGHT1, TOLLENGHT2, TOLWIDTH1, TOLWIDTH2, TOLTHICKNESS,
-                TOLROOTSIDEANGLEA2, TOLTIPSIDEANGLEA1, TOLTIPSIDEANGLEA2,
-                TOLANGLEB1, TOLANGLEB2, TOLROOTSIDEANGLEC1, TOLROOTSIDEANGLEC2,
-                TOLTIPSIDEANGLEC1, TOLTIPSIDEANGLEC2, TOLT1, TOLT2
-            FROM SKP_KITUPLOAD
-            WHERE ELEMENTDESC = ?
-              AND PALLETNUMBER = ?
-              AND BOXNUMBER = ?
-        """
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, normalize_string(element_desc, 100))
-        ibm_db.bind_param(stmt, 2, normalize_string(pallet_number or '', 100))
-        ibm_db.bind_param(stmt, 3, normalize_string(box_number or '', 50))
-        ibm_db.execute(stmt)
-
-        row = ibm_db.fetch_assoc(stmt)
-        if not row:
-            return None
-
-        tolerance_data = {}
-        fields = [
-            'TOLLENGHT1', 'TOLLENGHT2', 'TOLWIDTH1', 'TOLWIDTH2', 'TOLTHICKNESS',
-            'TOLROOTSIDEANGLEA2', 'TOLTIPSIDEANGLEA1', 'TOLTIPSIDEANGLEA2',
-            'TOLANGLEB1', 'TOLANGLEB2', 'TOLROOTSIDEANGLEC1', 'TOLROOTSIDEANGLEC2',
-            'TOLTIPSIDEANGLEC1', 'TOLTIPSIDEANGLEC2', 'TOLT1', 'TOLT2'
-        ]
-
-        for field in fields:
-            value = row.get(field)
-            if value is None:
-                value = row.get(field.upper())
-            if value is None:
-                value = row.get(field.lower())
-            if value is not None and isinstance(value, str) and value.strip() == '':
-                value = None
-            tolerance_data[field] = value
-
-        return tolerance_data
-    except Exception as exc:
-        print(f"Error fetching KITUPLOAD tolerance data: {exc}")
-        return None
-    finally:
-        if conn is not None:
-            try:
-                ibm_db.close(conn)
-            except Exception:
-                pass
-
-
-def fetch_kitupload_full_row(element_desc, pallet_number=None, box_number=None):
-    """Fetch the full non-tolerance row from SKP_KITUPLOAD for an element."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        columns = [
-            'COMPANYCODE', 'PARTDESC', 'TOTALPCS', 'ITEMTYPECODE',
-            'DECOSUBCODE01', 'DECOSUBCODE02', 'DECOSUBCODE03', 'DECOSUBCODE04',
-            'DECOSUBCODE05', 'DECOSUBCODE06', 'DECOSUBCODE07', 'DECOSUBCODE08',
-            'DECOSUBCODE09', 'DECOSUBCODE10', 'CODE', 'ELEMENTDESC', 'BOXNUMBER',
-            'ELEMENTSEQ', 'FBGFABRIC', 'CUTTYPE', 'PALLETNUMBER', 'PAPERTUBE',
-            'WEIGHTUNITOFMEASURECODE', 'NETWEIGHT', 'GROSSWEIGHT', 'CREATIONDATETIME',
-            'CREATIONUSER', 'ABSUNIQUEID', 'BOXSEQUENCE', 'PACKINGSEQUENCE',
-            'PLACEMENTINBOX', 'LENGHT1', 'LENGHT2', 'WIDTH1', 'WIDTH2', 'THICKNESS',
-            'ROOTSIDEANGLEA2', 'TIPSIDEANGLEA1', 'TIPSIDEANGLEA2', 'ANGLEB1', 'ANGLEB2',
-            'ROOTSIDEANGLEC1', 'ROOTSIDEANGLEC2', 'TIPSIDEANGLEC1', 'TIPSIDEANGLEC2', 'T1', 'T2'
-        ]
-        query = f"""
-            SELECT {', '.join(columns)}
-            FROM SKP_KITUPLOAD
-            WHERE ELEMENTDESC = ?
-              AND PALLETNUMBER = ?
-              AND BOXNUMBER = ?
-        """
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, normalize_string(element_desc, 100))
-        ibm_db.bind_param(stmt, 2, normalize_string(pallet_number or '', 100))
-        ibm_db.bind_param(stmt, 3, normalize_string(box_number or '', 50))
-        ibm_db.execute(stmt)
-
-        row = ibm_db.fetch_assoc(stmt)
-        if not row:
-            return None
-
-        data = {}
-        for field in columns:
-            value = row.get(field)
-            if value is None:
-                value = row.get(field.upper())
-            if value is None:
-                value = row.get(field.lower())
-            if value is not None and isinstance(value, str) and value.strip() == '':
-                value = None
-            data[field] = value
-        return data
-    except Exception as exc:
-        print(f"Error fetching KITUPLOAD full row: {exc}")
-        return None
-    finally:
-        if conn is not None:
-            try:
-                ibm_db.close(conn)
-            except Exception:
-                pass
-
-
-# ==================== GET ELEMENT DATA ====================
-def get_element_data(request, element_id):
-    """Fetch dimensions from SKP_RCP and tolerance from SKP_KITUPLOAD"""
-    order_code = request.GET.get("order_code")
-    demand_code = request.GET.get("demand_code")
-    element_desc = request.GET.get("element_desc") or element_id
-    pallet_number = request.GET.get("pallet_number", "")
-    box_number = request.GET.get("box_number", "")
-
-    conn = None
-    try:
-        conn = get_db_connection()
-
-        # ------------------ RCP DATA ------------------
-        rcp_table = get_rcp_table_name()
-        rcp_sql = f"""
-        SELECT
-            LENGHT1, LENGHT2, WIDTH1, WIDTH2, THICKNESS,
-            ROOTSIDEANGLEA2, TIPSIDEANGLEA1, TIPSIDEANGLEA2,
-            ANGLEB1, ANGLEB2, ROOTSIDEANGLEC1, ROOTSIDEANGLEC2,
-            TIPSIDEANGLEC1, TIPSIDEANGLEC2, T1, T2
-        FROM {rcp_table}
-        WHERE ELEMENTDESC = ?
-        """
-
-        stmt = ibm_db.prepare(conn, rcp_sql)
-        ibm_db.bind_param(stmt, 1, element_desc)
-        ibm_db.execute(stmt)
-
-        rcp_row = ibm_db.fetch_assoc(stmt)
-        if not rcp_row:
-            rcp_row = {}
-
-        element_data = {}
-        fields = [
-            "LENGHT1", "LENGHT2", "WIDTH1", "WIDTH2", "THICKNESS",
-            "ROOTSIDEANGLEA2", "TIPSIDEANGLEA1", "TIPSIDEANGLEA2",
-            "ANGLEB1", "ANGLEB2", "ROOTSIDEANGLEC1", "ROOTSIDEANGLEC2",
-            "TIPSIDEANGLEC1", "TIPSIDEANGLEC2", "T1", "T2"
-        ]
-
-        for field in fields:
-            value = rcp_row.get(field)
-            if value is None:
-                value = rcp_row.get(field.upper())
-            if isinstance(value, str):
-                value = value.strip()
-            element_data[field] = value
-
-        # ------------------ KITUPLOAD TOLERANCE ------------------
-        tolerance_sql = """
-        SELECT
-            TOLLENGHT1, TOLLENGHT2, TOLWIDTH1, TOLWIDTH2, TOLTHICKNESS,
-            TOLROOTSIDEANGLEA2, TOLTIPSIDEANGLEA1, TOLTIPSIDEANGLEA2,
-            TOLANGLEB1, TOLANGLEB2, TOLROOTSIDEANGLEC1, TOLROOTSIDEANGLEC2,
-            TOLTIPSIDEANGLEC1, TOLTIPSIDEANGLEC2, TOLT1, TOLT2
-        FROM SKP_KITUPLOAD
-        WHERE ELEMENTDESC = ?
-        AND PALLETNUMBER = ?
-        AND BOXNUMBER = ?
-        """
-
-        stmt2 = ibm_db.prepare(conn, tolerance_sql)
-        ibm_db.bind_param(stmt2, 1, element_desc)
-        ibm_db.bind_param(stmt2, 2, pallet_number or '1')
-        ibm_db.bind_param(stmt2, 3, box_number or '1')
-        ibm_db.execute(stmt2)
-
-        tol_row = ibm_db.fetch_assoc(stmt2)
-
-        tolerance_data = {}
-        tol_fields = [
-            "TOLLENGHT1", "TOLLENGHT2", "TOLWIDTH1", "TOLWIDTH2", "TOLTHICKNESS",
-            "TOLROOTSIDEANGLEA2", "TOLTIPSIDEANGLEA1", "TOLTIPSIDEANGLEA2",
-            "TOLANGLEB1", "TOLANGLEB2", "TOLROOTSIDEANGLEC1", "TOLROOTSIDEANGLEC2",
-            "TOLTIPSIDEANGLEC1", "TOLTIPSIDEANGLEC2", "TOLT1", "TOLT2"
-        ]
-
-        if tol_row:
-            for field in tol_fields:
-                value = tol_row.get(field)
-                if value is None:
-                    value = tol_row.get(field.upper())
-                if isinstance(value, str):
-                    value = value.strip()
-                tolerance_data[field] = value
-
-        return JsonResponse({
-            "status": "success",
-            "element_data": element_data,
-            "tolerance_data": tolerance_data
-        })
-
-    except Exception as e:
-        print(e)
-        return JsonResponse({
-            "status": "error",
-            "message": str(e)
-        })
-    finally:
-        if conn:
-            ibm_db.close(conn)
-
-
-# ==================== SAVE ELEMENT DIMENSIONS ====================
-@csrf_exempt
-def save_element_dimensions(request):
-    """Save dimension values to SKP_RCP table"""
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': 'Method not allowed'})
-    
-    try:
-        data = json.loads(request.body)
-        element_id = data.get('element_id')
-        element_desc = data.get('element_desc') or element_id
-        order_code = data.get('order_code')
-        demand_code = data.get('demand_code')
-        pallet_number = data.get('pallet_number')
-        box_number = data.get('box_number')
-        dimensions = data.get('dimensions', {})
-        
-        if not element_desc or not order_code or not demand_code:
-            return JsonResponse({'status': 'error', 'message': 'Missing required fields'})
-        
-        if not dimensions:
-            return JsonResponse({'status': 'error', 'message': 'No dimensions to save'})
-
-        baseline_data = fetch_kitupload_baseline_data(element_desc, order_code, demand_code, pallet_number, box_number) or {}
-        tolerance_data = fetch_kitupload_tolerance_data(element_desc, order_code, demand_code, pallet_number, box_number) or {}
-        full_row = fetch_kitupload_full_row(element_desc, pallet_number, box_number) or {}
-
-        allowed_columns = [
-            'LENGHT1', 'LENGHT2', 'WIDTH1', 'WIDTH2', 'THICKNESS',
-            'ROOTSIDEANGLEA2', 'TIPSIDEANGLEA1', 'TIPSIDEANGLEA2',
-            'ANGLEB1', 'ANGLEB2', 'ROOTSIDEANGLEC1', 'ROOTSIDEANGLEC2',
-            'TIPSIDEANGLEC1', 'TIPSIDEANGLEC2', 'T1', 'T2'
-        ]
-        tolerance_columns = [
-            'TOLLENGHT1', 'TOLLENGHT2', 'TOLWIDTH1', 'TOLWIDTH2', 'TOLTHICKNESS',
-            'TOLROOTSIDEANGLEA2', 'TOLTIPSIDEANGLEA1', 'TOLTIPSIDEANGLEA2',
-            'TOLANGLEB1', 'TOLANGLEB2', 'TOLROOTSIDEANGLEC1', 'TOLROOTSIDEANGLEC2',
-            'TOLTIPSIDEANGLEC1', 'TOLTIPSIDEANGLEC2', 'TOLT1', 'TOLT2'
-        ]
-        insert_columns_list = [
-            'COMPANYCODE', 'PRODUCTIONORDERCODE', 'PRODUCTIONDEMANDCODE', 'ITEMTYPECODE',
-            'DECOSUBCODE01', 'DECOSUBCODE02', 'DECOSUBCODE03', 'DECOSUBCODE04',
-            'DECOSUBCODE05', 'DECOSUBCODE06', 'DECOSUBCODE07', 'DECOSUBCODE08',
-            'DECOSUBCODE09', 'DECOSUBCODE10', 'CODE', 'ELEMENTDESC', 'BOXNUMBER',
-            'ELEMENTSEQ', 'FBGFABRIC', 'CUTTYPE', 'PALLETNUMBER', 'PAPERTUBE',
-            'WEIGHTUNITOFMEASURECODE', 'NETWEIGHT', 'GROSSWEIGHT', 'CREATIONDATETIME',
-            'CREATIONUSER', 'ABSUNIQUEID', 'BOXSEQUENCE', 'PACKINGSEQUENCE',
-            'PLACEMENTINBOX', 'LENGHT1', 'LENGHT2', 'WIDTH1', 'WIDTH2', 'THICKNESS',
-            'ROOTSIDEANGLEA2', 'TIPSIDEANGLEA1', 'TIPSIDEANGLEA2', 'ANGLEB1', 'ANGLEB2',
-            'ROOTSIDEANGLEC1', 'ROOTSIDEANGLEC2', 'TIPSIDEANGLEC1', 'TIPSIDEANGLEC2', 'T1', 'T2'
-        ] + tolerance_columns
-
-        def resolve_insert_value(field):
-            if field == 'ELEMENTDESC':
-                return element_desc
-            if field == 'PRODUCTIONORDERCODE':
-                return order_code
-            if field == 'PRODUCTIONDEMANDCODE':
-                return demand_code
-            if field == 'BOXNUMBER':
-                return box_number
-            if field == 'PALLETNUMBER':
-                return pallet_number
-            if field in tolerance_columns:
-                source_field = field.replace('TOL', '')
-                if source_field in dimensions:
-                    return dimensions[source_field]
-                value = tolerance_data.get(field)
-                if value is not None:
-                    return value
-                return full_row.get(field)
-            if field in dimensions and field in allowed_columns:
-                return dimensions[field]
-            if field in full_row:
-                return full_row.get(field)
-            if field in baseline_data:
-                return baseline_data[field]
-            return None
-
-        table_name = get_rcp_table_name()
-        table_columns = get_table_columns(table_name)
-        if not table_columns:
-            table_columns = {
-                'ELEMENTDESC', 'BOXNUMBER', 'PALLETNUMBER', 'ELEMENTSEQ', 'PACKINGSEQUENCE'
-            } | set(allowed_columns) | set(tolerance_columns)
-        else:
-            table_columns = set(table_columns)
-
-        update_columns = []
-        update_values = []
-
-        for field in allowed_columns:
-            if field not in dimensions:
-                continue
-
-            raw_value = dimensions[field]
-            try:
-                value = float(raw_value)
-            except (TypeError, ValueError):
-                return JsonResponse({'status': 'error', 'message': f'Invalid numeric value for {field}'})
-
-            baseline = baseline_data.get(field)
-            tolerance_key = f'TOL{field}'
-            tolerance = tolerance_data.get(tolerance_key)
-
-            if baseline is not None and tolerance is not None:
-                try:
-                    baseline_value = float(baseline)
-                    tolerance_value = float(tolerance)
-                except (TypeError, ValueError):
-                    return JsonResponse({'status': 'error', 'message': f'Invalid baseline/tolerance for {field}'})
-
-                min_allowed = baseline_value - tolerance_value
-                max_allowed = baseline_value + tolerance_value
-                if value < min_allowed or value > max_allowed:
-                    return JsonResponse({
-                        'status': 'error',
-                        'message': f'{field} value {value} is outside allowed range {min_allowed} - {max_allowed}'
-                    })
-
-            update_columns.append(f"{field} = ?")
-            update_values.append(normalize_string(raw_value, 10))
-            tol_field = f'TOL{field}'
-            if tol_field in table_columns:
-                update_columns.append(f"{tol_field} = ?")
-                update_values.append(normalize_string(raw_value, 10))
-
-        if not update_columns:
-            return JsonResponse({'status': 'error', 'message': 'No valid dimension fields found'})
-
-        conn = get_db_connection()
-        try:
-            existing_row = rcp_row_exists(element_desc)
-        except Exception:
-            existing_row = True
-
-        if existing_row:
-            query = f"""
-                UPDATE {table_name}
-                SET {', '.join(update_columns)}
-                WHERE ELEMENTDESC = ?
-            """
-            update_values.append(normalize_string(element_desc, 100))
-        else:
-            insert_columns = []
-            insert_values = []
-            required_not_null = {
-                'COMPANYCODE', 'PRODUCTIONORDERCODE', 'PRODUCTIONDEMANDCODE',
-                'ITEMTYPECODE', 'ABSUNIQUEID'
+    // Fetch data from server
+    fetch(
+`/get_element_data/${encodeURIComponent(elementId)}/?order_code=${orderCode}&demand_code=${demandCode}&pallet_number=${palletNumber}&box_number=${boxNumber}`,{
+        headers: {
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+    })
+        .then(response => {
+            const contentType = response.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+                return response.json();
             }
-            for field in insert_columns_list:
-                if field not in table_columns:
-                    continue
+            return response.text().then(text => {
+                throw new Error(text.replace(/<[^>]+>/g, '').slice(0, 300));
+            });
+        })
+        .then(data => {
+            if (data.status === 'success') {
+                elementData = data.element_data || {};
+                baselineData = data.baseline_data || {};
+                toleranceData = data.tolerance_data || {};
+                renderInputFields();
+            } else {
+                console.error('Element data fetch failed:', data);
+                document.getElementById('elementInputs').innerHTML = '<div class="text-red-500 py-4">Error: ' + (data.message || 'Unknown error') + '</div>';
+            }
+        })
+        .catch(error => {
+            console.error('Error fetching element data:', error);
+            document.getElementById('elementInputs').innerHTML = '<div class="text-red-500 py-4">Error loading data: ' + error.message + '</div>';
+        });
+}
 
-                value = resolve_insert_value(field)
-                if value is None and field not in required_not_null:
-                    continue
+// Render input fields based on data availability
+function renderInputFields(){
 
-                insert_columns.append(field)
-                insert_values.append(get_insert_value(field, value))
+const container=document.getElementById("elementInputs");
 
-            query = f"""
-                INSERT INTO {table_name} ({', '.join(insert_columns)})
-                VALUES ({', '.join(['?'] * len(insert_columns))})
-            """
-            update_values = insert_values
+let html="";
 
-        stmt = ibm_db.prepare(conn, query)
-        for index, value in enumerate(update_values, start=1):
-            ibm_db.bind_param(stmt, index, value)
+let hasFields=false;
 
-        ibm_db.execute(stmt)
-        ibm_db.commit(conn)
+FIELD_CONFIG.forEach(field=>{
 
-        print(f"Dimensions inserted into {table_name} for element {element_id}: {dimensions}")
-        return JsonResponse({'status': 'success', 'message': 'Dimensions saved successfully'})
-        
-    except Exception as e:
-        print(f"Error saving dimensions: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return JsonResponse({'status': 'error', 'message': str(e)})
+const baselineValue = baselineData[field.id];
+const value = baselineValue !== undefined && baselineValue !== null && baselineValue !== ''
+    ? baselineValue
+    : (elementData[field.id] ?? "");
+const tolerance = toleranceData[field.tolField];
+const hasField = (baselineValue !== undefined && baselineValue !== null && baselineValue !== '')
+    || (tolerance !== undefined && tolerance !== null && tolerance !== "");
 
+if (hasField) {
+    hasFields = true;
 
-# ==================== FETCH DATA VIEW ====================
-def fetch_data(request):
-    if request.method == 'POST':
-        production_order_code = request.POST.get('production_order_code', '').strip()
-        production_demand_code = request.POST.get('production_demand_code', '').strip()
-        pallet_number = request.POST.get('pallet_number', '1').strip()
-        box_number = request.POST.get('box_number', '1').strip()
+html+=`
 
-        customer_data = fetch_customer_data(production_order_code, production_demand_code)
-        product_details = fetch_product_details(production_order_code, production_demand_code)
-        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
-        
-        # Extract PressurBal, PL1 and packing_sequence with kit_elements
-        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
-        print(f"Extracted PressurBal: {pressur_bal}, PL1: {pl1}, PackingSeq: {packing_sequence}")
-        
-        if product_details:
-            product_details['PressurBal'] = pressur_bal
-            product_details['PL1'] = pl1
-            product_details['PackingSequence'] = packing_sequence
+<div class="mb-4">
 
-        context = {
-            'customer_data': customer_data if customer_data else {
-                'CustomerName': 'Not Available',
-                'CustomerPO': 'Not Available',
-                'CustomerCode': 'Not Available'
-            },
-            'product_details': product_details if product_details else {
-                'ItemType': 'Not Available',
-                'Subcode01': 'N/A',
-                'Subcode02': 'N/A',
-                'Subcode03': 'N/A',
-                'Subcode04': 'N/A',
-                'Subcode05': 'N/A',
-                'PressurBal': '',
-                'PL1': '',
-                'PackingSequence': ''
-            },
-            'kit_elements': kit_elements or [],
-            'production_order_code': production_order_code,
-            'production_demand_code': production_demand_code,
-            'pallet_number': pallet_number,
-            'box_number': box_number,
-            'packing_sequence': packing_sequence,
-            'MEDIA_URL': settings.MEDIA_URL
+<label class="block font-semibold mb-1">
+
+${field.label}
+
+</label>
+
+<input
+
+type="number"
+
+step="any"
+
+id="input_${field.id}"
+
+value="${value}"
+
+class="w-full border rounded-lg p-2"
+
+oninput="validateField('${field.id}')"
+
+>
+
+<div id="error_${field.id}" class="text-red-500 text-sm hidden"></div>
+
+<div id="tol_info_${field.id}" class="text-gray-500 text-xs">
+
+${formatToleranceText(field.id,tolerance)}
+
+</div>
+
+</div>
+
+`;
+
+}
+
+});
+
+if(hasFields){
+
+html+=`
+
+<button
+
+id="submitBtn"
+
+onclick="submitElementData()"
+
+class="bg-blue-600 text-white px-5 py-2 rounded"
+
+>
+
+Submit
+
+</button>
+
+`;
+
+}else{
+
+html=`
+
+<div class="text-center text-gray-600 py-6">
+
+No Dimension Found
+
+</div>
+
+`;
+
+}
+
+container.innerHTML=html;
+
+FIELD_CONFIG.forEach(field=>{
+
+if(document.getElementById("input_"+field.id))
+
+validateField(field.id);
+
+});
+
+}
+
+function formatToleranceText(fieldId, tolerance) {
+    const baselineValue = parseFloat(baselineData[fieldId]);
+    const parsedTolerance = parseFloat(tolerance);
+
+    if (!isNaN(parsedTolerance)) {
+        if (!isNaN(baselineValue)) {
+            const min = baselineValue - parsedTolerance;
+            const max = baselineValue + parsedTolerance;
+            return `Baseline ${baselineValue}, tolerance ${parsedTolerance}: allowed range ${min} - ${max}`;
         }
+        return `Tolerance: ±${parsedTolerance}`;
+    }
+    return 'Tolerance: N/A';
+}
 
-        if not any([customer_data, product_details, kit_elements]):
-            context['error'] = "No data found for the provided codes"
-            return render(request, 'fetch_data.html', context)
-
-        return render(request, 'view_data.html', context)
-
-    return render(request, 'fetch_data.html')
-
-
-# ==================== VIEW DATA ====================
-def view_data(request):
-    if request.method == 'POST':
-        production_order_code = request.POST.get('production_order_code', '').strip()
-        production_demand_code = request.POST.get('production_demand_code', '').strip()
-        pallet_number = request.POST.get('pallet_number', '1').strip()
-        box_number = request.POST.get('box_number', '1').strip()
-
-        customer_data = fetch_customer_data(production_order_code, production_demand_code)
-        product_details = fetch_product_details(production_order_code, production_demand_code)
-        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
-        
-        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
-        
-        if product_details:
-            product_details['PressurBal'] = pressur_bal
-            product_details['PL1'] = pl1
-            product_details['PackingSequence'] = packing_sequence
-
-        context = {
-            'customer_data': customer_data if customer_data else {
-                'CustomerName': 'Not Available',
-                'CustomerPO': 'Not Available',
-                'CustomerCode': 'Not Available'
-            },
-            'product_details': product_details if product_details else {
-                'ItemType': 'Not Available',
-                'Subcode01': 'N/A',
-                'Subcode02': 'N/A',
-                'Subcode03': 'N/A',
-                'Subcode04': 'N/A',
-                'Subcode05': 'N/A',
-                'PressurBal': '',
-                'PL1': '',
-                'PackingSequence': ''
-            },
-            'kit_elements': kit_elements or [],
-            'production_order_code': production_order_code,
-            'production_demand_code': production_demand_code,
-            'pallet_number': pallet_number,
-            'box_number': box_number,
-            'packing_sequence': packing_sequence,
-            'MEDIA_URL': settings.MEDIA_URL
-        }
-
-        return render(request, 'view_data.html', context)
-
-    # GET request handling
-    production_order_code = request.GET.get('production_order_code', '').strip()
-    production_demand_code = request.GET.get('production_demand_code', '').strip()
-    pallet_number = request.GET.get('pallet_number', '1').strip()
-    box_number = request.GET.get('box_number', '1').strip()
-
-    if production_order_code and production_demand_code:
-        customer_data = fetch_customer_data(production_order_code, production_demand_code)
-        product_details = fetch_product_details(production_order_code, production_demand_code)
-        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
-        
-        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
-        
-        if product_details:
-            product_details['PressurBal'] = pressur_bal
-            product_details['PL1'] = pl1
-            product_details['PackingSequence'] = packing_sequence
-
-        context = {
-            'customer_data': customer_data if customer_data else {
-                'CustomerName': 'Not Available',
-                'CustomerPO': 'Not Available',
-                'CustomerCode': 'Not Available'
-            },
-            'product_details': product_details if product_details else {
-                'ItemType': 'Not Available',
-                'Subcode01': 'N/A',
-                'Subcode02': 'N/A',
-                'Subcode03': 'N/A',
-                'Subcode04': 'N/A',
-                'Subcode05': 'N/A',
-                'PressurBal': '',
-                'PL1': '',
-                'PackingSequence': ''
-            },
-            'kit_elements': kit_elements or [],
-            'production_order_code': production_order_code,
-            'production_demand_code': production_demand_code,
-            'pallet_number': pallet_number,
-            'box_number': box_number,
-            'packing_sequence': packing_sequence,
-            'MEDIA_URL': settings.MEDIA_URL
-        }
-
-        return render(request, 'view_data.html', context)
-
-    return render(request, 'fetch_data.html')
-
-
-# ==================== API ENDPOINTS ====================
-@csrf_exempt
-def validate_field_api(request):
-    """API endpoint for real-time field validation"""
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': 'Method not allowed'}, status=405)
+// Validate field against tolerance
+function validateField(fieldId) {
+    const input = document.getElementById(`input_${fieldId}`);
+    const errorDiv = document.getElementById(`error_${fieldId}`);
+    const tolInfo = document.getElementById(`tol_info_${fieldId}`);
+    const submitBtn = document.getElementById('submitBtn');
     
-    try:
-        data = json.loads(request.body)
-        field_name = data.get('field')
-        value = data.get('value')
-        code = data.get('code')
-        
-        if not all([field_name, code]):
-            return JsonResponse({
-                'success': False,
-                'error': 'Missing required parameters'
-            }, status=400)
-        
-        tolerance_data = fetch_tolerance_data(code)
-        
-        if not tolerance_data:
-            return JsonResponse({
-                'success': False,
-                'error': 'No tolerance data found'
-            }, status=404)
-        
-        is_valid, error_msg, range_val = validate_single_field(field_name, value, tolerance_data)
-        
-        return JsonResponse({
-            'success': True,
-            'is_valid': is_valid,
-            'error_message': error_msg,
-            'range': range_val
-        })
-        
-    except json.JSONDecodeError:
-        return JsonResponse({
-            'success': False,
-            'error': 'Invalid JSON'
-        }, status=400)
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e)
-        }, status=500)
+    if (!input || !errorDiv) return true;
 
+    const value = parseFloat(input.value);
+    const field = FIELD_CONFIG.find(f => f.id === fieldId);
+    const tolerance = parseFloat(toleranceData[field.tolField]);
+    const baseline = parseFloat(baselineData[field.id]);
 
-@csrf_exempt
-def submit_rcp_data_api(request):
-    """API endpoint for RCP form submission"""
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': 'Method not allowed'}, status=405)
+    // Reset error state
+    errorDiv.classList.add('hidden');
+    input.classList.remove('border-red-500', 'border-green-500');
+
+    if (tolInfo) {
+        tolInfo.textContent = formatToleranceText(fieldId, tolerance);
+    }
+
+    if (isNaN(value)) {
+        if (submitBtn) {
+            const allValid = checkAllFieldsValid();
+            submitBtn.disabled = !allValid;
+        }
+        return false;
+    }
+
+    if (!isNaN(tolerance) && !isNaN(baseline)) {
+        const minAllowed = baseline - tolerance;
+        const maxAllowed = baseline + tolerance;
+
+        if (value < minAllowed || value > maxAllowed) {
+            errorDiv.textContent = `Value ${value} must be between ${minAllowed} and ${maxAllowed}`;
+            errorDiv.classList.remove('hidden');
+            input.classList.add('border-red-500');
+            if (submitBtn) submitBtn.disabled = true;
+            return false;
+        }
+    }
+
+    input.classList.add('border-green-500');
+    if (submitBtn) {
+        const allValid = checkAllFieldsValid();
+        submitBtn.disabled = !allValid;
+    }
+    return true;
+}
+
+// Check if all fields have valid values
+function checkAllFieldsValid() {
+    const fields = document.querySelectorAll('[id^="input_"]');
+    let allValid = true;
+
+    fields.forEach(input => {
+        const fieldId = input.id.replace('input_', '');
+        const value = parseFloat(input.value);
+        const errorDiv = document.getElementById(`error_${fieldId}`);
+
+        if (isNaN(value)) {
+            allValid = false;
+            if (errorDiv) {
+                errorDiv.textContent = 'Please enter a valid number';
+                errorDiv.classList.remove('hidden');
+                input.classList.add('border-red-500');
+            }
+            return;
+        }
+
+        const field = FIELD_CONFIG.find(f => f.id === fieldId);
+        const tolerance = parseFloat(toleranceData[field.tolField]);
+        const baseline = parseFloat(baselineData[fieldId]);
+
+        if (!isNaN(tolerance) && !isNaN(baseline)) {
+            const minAllowed = baseline - tolerance;
+            const maxAllowed = baseline + tolerance;
+            if (value < minAllowed || value > maxAllowed) {
+                allValid = false;
+                if (errorDiv) {
+                    errorDiv.textContent = `Value ${value} must be between ${minAllowed} and ${maxAllowed}`;
+                    errorDiv.classList.remove('hidden');
+                    input.classList.add('border-red-500');
+                }
+                return;
+            }
+        }
+
+        if (errorDiv) {
+            errorDiv.classList.add('hidden');
+        }
+        input.classList.remove('border-red-500');
+        input.classList.add('border-green-500');
+    });
+
+    return allValid;
+}
+
+// Submit element data
+function submitElementData() {
+    const fields = document.querySelectorAll('[id^="input_"]');
+    let allValid = true;
+    let formData = {};
+
+    fields.forEach(input => {
+        const fieldId = input.id.replace('input_', '');
+        const value = parseFloat(input.value);
+        const errorDiv = document.getElementById(`error_${fieldId}`);
+        const field = FIELD_CONFIG.find(f => f.id === fieldId);
+        const tolerance = parseFloat(toleranceData[field.tolField]);
+        const baseline = parseFloat(baselineData[fieldId]);
+
+        if (isNaN(value)) {
+            allValid = false;
+            if (errorDiv) {
+                errorDiv.textContent = 'Please enter a valid number';
+                errorDiv.classList.remove('hidden');
+                input.classList.add('border-red-500');
+            }
+            return;
+        }
+
+        if (!isNaN(tolerance) && !isNaN(baseline)) {
+            const minAllowed = baseline - tolerance;
+            const maxAllowed = baseline + tolerance;
+            if (value < minAllowed || value > maxAllowed) {
+                allValid = false;
+                if (errorDiv) {
+                    errorDiv.textContent = `Value ${value} must be between ${minAllowed} and ${maxAllowed}`;
+                    errorDiv.classList.remove('hidden');
+                    input.classList.add('border-red-500');
+                }
+                return;
+            }
+        }
+
+        formData[fieldId] = value;
+    });
+
+    if (!allValid) {
+        alert('Please fix all validation errors before submitting.');
+        return;
+    }
+
+    // Submit data
+    const selectedElement = document.getElementById('kitElementSelect').value;
+    const elementDesc = document.getElementById('kitElementSelect').options[document.getElementById('kitElementSelect').selectedIndex].text;
+
+    const payload = {
+        element_id: selectedElement,
+        element_desc: elementDesc,
+        order_code: orderCode,
+        demand_code: demandCode,
+        pallet_number: palletNumber,
+        box_number: boxNumber,
+        dimensions: formData
+    };
+
+    fetch('/save_element_dimensions/', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-CSRFToken': getCookie('csrftoken')
+        },
+        body: JSON.stringify(payload)
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'success') {
+            alert('✅ Dimensions saved successfully!');
+            location.reload();
+        } else {
+            alert('❌ Error: ' + data.message);
+        }
+    })
+    .catch(error => {
+        console.error('Error saving dimensions:', error);
+        alert('Error saving dimensions. Please try again.');
+    });
+}
+
+// Camera functions
+function openCameraModal(elementId, elementDesc) {
+    console.log('========== OPENING CAMERA ==========');
+    console.log('Element:', elementDesc);
     
-    try:
-        data = json.loads(request.body)
-        
-        required_fields = ['PRODUCTIONORDERCODE', 'PRODUCTIONDEMANDCODE', 'CODE']
-        for field in required_fields:
-            if field not in data:
-                return JsonResponse({
-                    'success': False,
-                    'error': f'Missing required field: {field}'
-                }, status=400)
-        
-        result = process_rcp_submission(data, data.get('CODE'))
-        
-        if result['success']:
-            return JsonResponse(result)
-        else:
-            return JsonResponse(result, status=400)
-        
-    except json.JSONDecodeError:
-        return JsonResponse({
-            'success': False,
-            'error': 'Invalid JSON'
-        }, status=400)
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e)
-        }, status=500)
+    captureStartTime = new Date().toISOString();
+    backImageCaptureTime = null;
+    frontImageCaptureTime = null;
+    uploadStartTime = null;
+    console.log(`⏱️ Capture started at: ${captureStartTime}`);
+    
+    currentElementId = elementId;
+    document.getElementById('elementIdInput').value = elementId;
+    document.getElementById('elementDescInput').value = elementDesc;
+    document.getElementById('cameraModalTitle').textContent = `Take Picture: ${elementDesc}`;
+    
+    document.getElementById('cameraModal').classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+    
+    document.getElementById('cameraFeed').classList.remove('hidden');
+    document.getElementById('frontCameraFeed').classList.add('hidden');
+    document.getElementById('imagePreview').classList.add('hidden');
+    document.getElementById('captureBtn').classList.remove('hidden');
+    document.getElementById('uploadBtn').classList.add('hidden');
+    document.getElementById('retakeBtn').classList.add('hidden');
+    
+    frontCameraReady = false;
+    frontCameraAttempts = 0;
+    faceCaptureInProgress = false;
+    
+    startBackCamera();
+    setTimeout(startFrontCamera, 1000);
+}
 
+function closeCameraModal() {
+    console.log('Closing camera modal');
+    stopAllCameras();
+    document.getElementById('cameraModal').classList.add('hidden');
+    document.body.style.overflow = 'auto';
+    
+    if (captureStartTime && !uploadStartTime) {
+        saveTimingLogToServer('cancelled', { image_type: 'Cancelled before upload' });
+    }
+    
+    captureStartTime = null;
+    backImageCaptureTime = null;
+    frontImageCaptureTime = null;
+}
 
-def get_product_data_api(request):
-    """API endpoint to get product data"""
-    try:
-        code = request.GET.get('code')
-        pallet = request.GET.get('pallet')
+async function startBackCamera() {
+    try {
+        console.log('Starting back camera...');
+        const constraints = {
+            video: {
+                facingMode: 'environment',
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+            }
+        };
         
-        if not code:
-            return JsonResponse({
-                'success': False,
-                'error': 'Missing code parameter'
-            }, status=400)
+        backStream = await navigator.mediaDevices.getUserMedia(constraints);
+        const video = document.getElementById('cameraFeed');
+        video.srcObject = backStream;
         
-        product_data = fetch_product_details(code, None)
-        kit_elements = fetch_kit_elements(code, None, pallet or 1, 1)
-        tolerance_data = fetch_tolerance_data(code)
-        
-        return JsonResponse({
-            'success': True,
-            'product': product_data,
-            'kit_elements': kit_elements,
-            'tolerance': tolerance_data
+        video.onloadedmetadata = () => {
+            video.play()
+                .then(() => {
+                    console.log('✓ Back camera started');
+                    console.log('  Dimensions:', video.videoWidth, 'x', video.videoHeight);
+                })
+                .catch(e => console.error('Error playing back camera:', e));
+        };
+    } catch (err) {
+        console.error('✗ Back camera error:', err);
+        alert('Could not access back camera. Please check permissions.');
+    }
+}
+
+async function startFrontCamera() {
+    try {
+        frontStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "user" }
+        });
+
+        const video = document.getElementById('frontCameraFeed');
+        video.classList.add('hidden');
+        video.srcObject = frontStream;
+        await video.play();
+        console.log("✅ FRONT CAMERA STARTED");
+    } catch (err) {
+        console.error("❌ FRONT CAMERA FAILED:", err);
+    }
+}
+
+function stopAllCameras() {
+    console.log('Stopping all cameras...');
+    if (backStream) {
+        backStream.getTracks().forEach(track => track.stop());
+        backStream = null;
+    }
+    if (frontStream) {
+        frontStream.getTracks().forEach(track => track.stop());
+        frontStream = null;
+    }
+    frontCameraReady = false;
+    frontCameraAttempts = 0;
+    faceCaptureInProgress = false;
+}
+
+async function captureImage() {
+    console.log("📸 STEP 1: Capture BACK image");
+    backImageCaptureTime = new Date().toISOString();
+    console.log(`⏱️ Back image captured at: ${backImageCaptureTime}`);
+    
+    const overlay = document.getElementById('captureOverlay');
+    overlay.classList.add('flash');
+    setTimeout(() => overlay.classList.remove('flash'), 300);
+    
+    const video = document.getElementById('cameraFeed');
+    const preview = document.getElementById('imagePreview');
+    const ctx = preview.getContext('2d');
+
+    preview.width = video.videoWidth;
+    preview.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0);
+
+    window.backImageData = preview.toDataURL('image/jpeg').split(',')[1];
+
+    if (backStream) {
+        backStream.getTracks().forEach(track => track.stop());
+    }
+
+    console.log("📸 STEP 2: Starting FRONT camera");
+    await startFrontCamera();
+    await new Promise(r => setTimeout(r, 800));
+    await captureFrontImage();
+
+    console.log("📸 STEP 3: Both images captured");
+    const bothCapturedTime = new Date().toISOString();
+    console.log(`⏱️ Both images captured at: ${bothCapturedTime}`);
+    
+    document.getElementById('uploadBtn').classList.remove('hidden');
+    document.getElementById('captureBtn').classList.add('hidden');
+}
+
+async function captureFrontImage() {
+    const video = document.getElementById('frontCameraFeed');
+    const canvas = document.getElementById('frontCameraCanvas');
+    const ctx = canvas.getContext('2d');
+    document.getElementById('captureBtn').classList.add('hidden');
+    let retries = 0;
+
+    while ((video.videoWidth === 0) && retries < 10) {
+        await new Promise(r => setTimeout(r, 200));
+        retries++;
+    }
+
+    if (!video.videoWidth) {
+        console.error("❌ FRONT STILL NOT READY");
+        return;
+    }
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0);
+
+    window.frontImageData = canvas.toDataURL('image/jpeg').split(',')[1];
+    frontImageCaptureTime = new Date().toISOString();
+    console.log(`⏱️ Front image captured at: ${frontImageCaptureTime}`);
+
+    console.log("✅ FRONT IMAGE CAPTURED");
+}
+
+function uploadPicture() {
+    console.log("========== UPLOADING BOTH IMAGES ==========");
+    uploadStartTime = new Date().toISOString();
+    console.log(`⏱️ Upload started at: ${uploadStartTime}`);
+    
+    const elementDesc = document.getElementById('elementDescInput').value;
+
+    const formData1 = new FormData(document.getElementById('uploadForm'));
+    formData1.set("element_image", window.backImageData);
+    formData1.set("is_human_image", "false");
+    formData1.set("capture_start_time", captureStartTime || new Date().toISOString());
+    formData1.set("back_capture_time", backImageCaptureTime || '');
+    formData1.set("front_capture_time", frontImageCaptureTime || '');
+    formData1.set("upload_start_time", uploadStartTime);
+    formData1.set("element_desc", elementDesc);
+
+    const formData2 = new FormData(document.getElementById('humanUploadForm'));
+    formData2.set("element_image", window.frontImageData);
+    formData2.set("is_human_image", "true");
+    formData2.set("element_desc", elementDesc);
+    formData2.set("capture_start_time", captureStartTime || new Date().toISOString());
+    formData2.set("back_capture_time", backImageCaptureTime || '');
+    formData2.set("front_capture_time", frontImageCaptureTime || '');
+    formData2.set("upload_start_time", uploadStartTime);
+
+    Promise.all([
+        fetch("/upload_element_image/", { 
+            method: "POST", 
+            body: formData1,
+            headers: {
+                'X-CSRFToken': getCookie('csrftoken')
+            }
+        }),
+        fetch("/upload_element_image/", { 
+            method: "POST", 
+            body: formData2,
+            headers: {
+                'X-CSRFToken': getCookie('csrftoken')
+            }
         })
+    ])
+    .then(responses => Promise.all(responses.map(r => r.json())))
+    .then(results => {
+        const uploadCompleteTime = new Date().toISOString();
+        console.log(`⏱️ Upload completed at: ${uploadCompleteTime}`);
         
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e)
-        }, status=500)
+        let totalDuration = null;
+        if (captureStartTime) {
+            const start = new Date(captureStartTime);
+            const end = new Date(uploadCompleteTime);
+            totalDuration = (end - start) / 1000;
+            console.log(`⏱️ TOTAL DURATION: ${totalDuration.toFixed(3)} seconds`);
+        }
+        
+        saveTimingLogToServer('success', { 
+            image_type: 'Both Images',
+            total_duration: totalDuration?.toFixed(3)
+        });
+        
+        alert('✅ Images uploaded successfully!\n⏱️ Total time: ' + (totalDuration ? totalDuration.toFixed(2) + ' seconds' : 'N/A'));
+        location.reload();
+    })
+    .catch(err => {
+        console.error("Upload failed:", err);
+        saveTimingLogToServer('failed', { 
+            image_type: 'Upload Failed', 
+            error: err.message 
+        });
+        alert("Upload failed: " + err.message);
+    });
+}
 
+function retakePicture() {
+    console.log('Retaking picture - resetting time tracking');
+    captureStartTime = new Date().toISOString();
+    backImageCaptureTime = null;
+    frontImageCaptureTime = null;
+    console.log(`⏱️ Retake started at: ${captureStartTime}`);
+    
+    document.getElementById('imagePreview').classList.add('hidden');
+    document.getElementById('cameraFeed').classList.remove('hidden');
+    document.getElementById('captureBtn').classList.remove('hidden');
+    document.getElementById('uploadBtn').classList.add('hidden');
+    document.getElementById('retakeBtn').classList.add('hidden');
+    faceCaptureInProgress = false;
+}
 
-def get_rcp_data_api(request):
-    """API endpoint to get existing RCP data"""
-    try:
-        order_code = request.GET.get('order_code')
-        demand_code = request.GET.get('demand_code')
-        
-        if not all([order_code, demand_code]):
-            return JsonResponse({
-                'success': False,
-                'error': 'Missing required parameters'
-            }, status=400)
-        
-        rcp_data = get_rcp_data(order_code, demand_code)
-        
-        return JsonResponse({
-            'success': True,
-            'data': rcp_data
+function saveTimingLogToServer(status, additionalData = {}) {
+    const elementDesc = document.getElementById('elementDescInput')?.value || 'Unknown';
+    const uploadCompleteTime = new Date().toISOString();
+    
+    let totalDuration = null;
+    let backCaptureDuration = null;
+    let frontCaptureDuration = null;
+    let betweenCapturesDuration = null;
+    let uploadDuration = null;
+    
+    if (captureStartTime && uploadCompleteTime) {
+        const start = new Date(captureStartTime);
+        const end = new Date(uploadCompleteTime);
+        totalDuration = ((end - start) / 1000).toFixed(3);
+    }
+    
+    if (captureStartTime && backImageCaptureTime) {
+        const start = new Date(captureStartTime);
+        const back = new Date(backImageCaptureTime);
+        backCaptureDuration = ((back - start) / 1000).toFixed(3);
+    }
+    
+    if (captureStartTime && frontImageCaptureTime) {
+        const start = new Date(captureStartTime);
+        const front = new Date(frontImageCaptureTime);
+        frontCaptureDuration = ((front - start) / 1000).toFixed(3);
+    }
+    
+    if (backImageCaptureTime && frontImageCaptureTime) {
+        const back = new Date(backImageCaptureTime);
+        const front = new Date(frontImageCaptureTime);
+        betweenCapturesDuration = Math.abs((front - back) / 1000).toFixed(3);
+    }
+    
+    if (uploadStartTime && uploadCompleteTime) {
+        const start = new Date(uploadStartTime);
+        const end = new Date(uploadCompleteTime);
+        uploadDuration = ((end - start) / 1000).toFixed(3);
+    }
+    
+    const logData = {
+        element_desc: elementDesc,
+        image_type: additionalData.image_type || (additionalData.is_human ? 'Human Image' : 'Element Image'),
+        status: status,
+        order_code: orderCode,
+        demand_code: demandCode,
+        customer_name: customerName,
+        customer_po: customerPO,
+        pallet_number: palletNumber,
+        box_number: boxNumber,
+        pl_value: additionalData.pl_value || '1',
+        capture_start_time: captureStartTime,
+        back_capture_time: backImageCaptureTime,
+        front_capture_time: frontImageCaptureTime,
+        upload_start_time: uploadStartTime,
+        upload_complete_time: uploadCompleteTime,
+        total_duration: totalDuration,
+        back_capture_duration: backCaptureDuration,
+        front_capture_duration: frontCaptureDuration,
+        between_captures_duration: betweenCapturesDuration,
+        upload_duration: uploadDuration,
+        folder_path: additionalData.folder_path || folderPathFromServer || 'N/A',
+        ip_address: '',
+        error_message: additionalData.error || ''
+    };
+    
+    console.log('📝 Saving timing log to network:', logData);
+    
+    try {
+        fetch('/save_timing_log/', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': getCookie('csrftoken')
+            },
+            body: JSON.stringify(logData)
         })
-        
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e)
-        }, status=500)
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'success') {
+                console.log('✅ Timing log saved to: \\\\192.168.4.32\\Corekit\\logs\\');
+            } else {
+                console.error('❌ Failed to save timing log:', data.message);
+            }
+        })
+        .catch(err => console.error('❌ Error saving timing log:', err));
+    } catch (err) {
+        console.error('❌ Error saving timing log:', err);
+    }
+}
+
+// Other functions
+function showImageModal(imageUrl) {
+    document.getElementById('modalImage').src = imageUrl;
+    document.getElementById('imageModal').classList.remove('hidden');
+}
+
+function closeImageModal(event) {
+    if (event.target.id === 'imageModal') {
+        document.getElementById('imageModal').classList.add('hidden');
+    }
+}
+
+function getCookie(name) {
+    let cookieValue = null;
+    if (document.cookie && document.cookie !== '') {
+        const cookies = document.cookie.split(';');
+        for (let i = 0; i < cookies.length; i++) {
+            const cookie = cookies[i].trim();
+            if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                break;
+            }
+        }
+    }
+    return cookieValue;
+}
+
+console.log('========== JAVASCRIPT LOADED ==========');
+console.log('Human image exists:', isHumanCaptured);
+console.log('Order Code:', orderCode);
+console.log('✅ Time tracking enabled - logs will be saved to: \\\\192.168.4.32\\Corekit\\logs\\');
+</script>
+
+<style>
+.hidden { display: none !important; }
+
+#cameraModal, #imageModal {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+#cameraFeed, #imagePreview {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+}
+
+#captureOverlay.flash {
+    opacity: 0.3 !important;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th {
+    background-color: #f9fafb;
+    font-weight: 500;
+}
+
+button {
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.fixed {
+    position: fixed;
+}
+.inset-0 {
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+}
+.h-screen {
+    height: 100vh;
+}
+.w-screen {
+    width: 100vw;
+}
+.flex-1 {
+    flex: 1 1 0%;
+}
+.object-contain {
+    object-fit: contain;
+}
+</style>
+{% endblock %}
