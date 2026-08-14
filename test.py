@@ -1,1279 +1,285 @@
 import os
+import base64
 import re
-import json
-import datetimeimport os
-import re
-import json
+import time
 import datetime
-import uuid
 from django.conf import settings
 from django.shortcuts import render, redirect
+from django.urls import reverse
+from django.contrib import messages
 from django.views.decorators.csrf import csrf_exempt
 from django.http import JsonResponse
+from django.utils.text import slugify
 from .utils.db_queries import fetch_customer_data, fetch_product_details, fetch_kit_elements
-from .utils.db_queries import get_db_connection
 import ibm_db
+from .utils.db_queries import get_db_connection
 
-
-def normalize_string(value, max_length=None):
-    if value is None:
-        return ''
-    if not isinstance(value, str):
-        value = str(value)
-    value = value.strip()
-    if max_length is not None and len(value) > max_length:
-        return value[:max_length]
-    return value
-
-
-def get_table_columns(table_name):
-    """Return the list of column names for a table.
-
-    This first tries SYSCAT.COLUMNS for the current schema, then falls back to
-    a simple `SELECT * FROM table WHERE 1=0` to read metadata from the statement.
+# ---------------------- HELPER: LOG TIME INFORMATION ----------------------
+def log_time_info(log_type, start_time, end_time, element_desc, production_order_code, production_demand_code, 
+                  customer_data, folder_structure, pallet_number, box_number, is_human_image=False, status="success"):
     """
-    conn = None
-    try:
-        conn = get_db_connection()
-        table_name_upper = normalize_string(table_name).upper()
-
-        # Try the catalog first; this is the safest, schema-aware path.
-        query = """
-            SELECT COLNAME
-            FROM SYSCAT.COLUMNS
-            WHERE TABNAME = ?
-              AND TABSCHEMA = CURRENT SCHEMA
-            ORDER BY COLNO
-        """
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, table_name_upper)
-        ibm_db.execute(stmt)
-
-        columns = []
-        row = ibm_db.fetch_assoc(stmt)
-        while row:
-            column_name = row.get('COLNAME') or row.get('colname')
-            if not column_name:
-                break
-            columns.append(column_name.upper())
-            row = ibm_db.fetch_assoc(stmt)
-
-        if columns:
-            return columns
-
-        # Fallback: describe the table by selecting zero rows.
-        fallback_query = f"SELECT * FROM {table_name_upper} WHERE 1=0"
-        stmt2 = ibm_db.prepare(conn, fallback_query)
-        ibm_db.execute(stmt2)
-
-        num_fields = ibm_db.num_fields(stmt2)
-        columns = []
-        for index in range(num_fields):
-            try:
-                field_name = ibm_db.field_name(stmt2, index)
-                if field_name:
-                    columns.append(field_name.upper())
-            except Exception:
-                continue
-
-        return columns
-    except Exception as exc:
-        print(f"Error fetching columns for {table_name}: {exc}")
-        return []
-    finally:
-        if conn is not None:
-            try:
-                ibm_db.close(conn)
-            except Exception:
-                pass
-
-
-def get_table_nullability(table_name):
-    """Return a map of {COLUMN_NAME: NULLS} for a table."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        query = """
-            SELECT COLNAME, NULLS
-            FROM SYSCAT.COLUMNS
-            WHERE TABNAME = ?
-              AND TABSCHEMA = CURRENT SCHEMA
-            ORDER BY COLNO
-        """
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, normalize_string(table_name).upper())
-        ibm_db.execute(stmt)
-
-        nullability = {}
-        row = ibm_db.fetch_assoc(stmt)
-        while row:
-            column_name = row.get('COLNAME') or row.get('colname')
-            nulls = row.get('NULLS')
-            if column_name:
-                nullability[column_name.upper()] = nulls
-            row = ibm_db.fetch_assoc(stmt)
-
-        return nullability
-    except Exception as exc:
-        print(f"Error fetching nullability for {table_name}: {exc}")
-        return {}
-    finally:
-        if conn is not None:
-            try:
-                ibm_db.close(conn)
-            except Exception:
-                pass
-
-
-def get_insert_value(field, value):
-    """Normalize insert values for SKP_RCP, avoiding NULLs on NOT NULL fields."""
-    field_lengths = {
-        'COMPANYCODE': 3,
-        'PRODUCTIONORDERCODE': 10,
-        'PRODUCTIONDEMANDCODE': 10,
-        'ITEMTYPECODE': 3,
-        'DECOSUBCODE01': 10,
-        'DECOSUBCODE02': 10,
-        'DECOSUBCODE03': 10,
-        'DECOSUBCODE04': 10,
-        'DECOSUBCODE05': 10,
-        'DECOSUBCODE06': 10,
-        'DECOSUBCODE07': 10,
-        'DECOSUBCODE08': 10,
-        'DECOSUBCODE09': 10,
-        'DECOSUBCODE10': 10,
-        'CODE': 100,
-        'ELEMENTDESC': 100,
-        'BOXNUMBER': 50,
-        'PALLETNUMBER': 100,
-        'PACKINGSEQUENCE': 50,
-        'LENGHT1': 10,
-        'LENGHT2': 10,
-        'WIDTH1': 10,
-        'WIDTH2': 10,
-        'THICKNESS': 10,
-        'ROOTSIDEANGLEA2': 10,
-        'TIPSIDEANGLEA1': 10,
-        'TIPSIDEANGLEA2': 10,
-        'ANGLEB1': 10,
-        'ANGLEB2': 10,
-        'ROOTSIDEANGLEC1': 10,
-        'ROOTSIDEANGLEC2': 10,
-        'TIPSIDEANGLEC1': 10,
-        'TIPSIDEANGLEC2': 10,
-        'T1': 10,
-        'T2': 10,
-        'CREATIONUSER': 25,
-        'CREATIONDATETIME': 26,
-        'NETWEIGHT': 100,
-        'GROSSWEIGHT': 100,
-        'ABSUNIQUEID': 19,
-        'BOXSEQUENCE': 100,
-        'FBGFABRIC': 100,
-        'CUTTYPE': 100,
-        'PAPERTUBE': 100,
-        'WEIGHTUNITOFMEASURECODE': 100,
-        'CODE': 100,
-        'PLACEMENTINBOX': 100,
-    }
-    numeric_fields = {
-        'TOTALPCS', 'ELEMENTSEQ', 'BOXSEQUENCE', 'PACKINGSEQUENCE',
-        'LENGHT1', 'LENGHT2', 'WIDTH1', 'WIDTH2', 'THICKNESS', 'T1', 'T2',
-        'TOLLENGHT1', 'TOLLENGHT2', 'TOLWIDTH1', 'TOLWIDTH2', 'TOLTHICKNESS',
-        'TOLROOTSIDEANGLEA2', 'TOLTIPSIDEANGLEA1', 'TOLTIPSIDEANGLEA2',
-        'TOLANGLEB1', 'TOLANGLEB2', 'TOLROOTSIDEANGLEC1', 'TOLROOTSIDEANGLEC2',
-        'TOLTIPSIDEANGLEC1', 'TOLTIPSIDEANGLEC2', 'TOLT1', 'TOLT2',
-        'NETWEIGHT', 'GROSSWEIGHT', 'ABSUNIQUEID'
-    }
-    datetime_fields = {'CREATIONDATETIME'}
-
-    max_length = field_lengths.get(field, 100)
-
-    if value is None:
-        if field in datetime_fields:
-            return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        if field in numeric_fields:
-            return 0
-        return ''
-
-    if field in datetime_fields:
-        if isinstance(value, str) and not value.strip():
-            return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        return normalize_string(value, max_length)
-
-    if field in numeric_fields:
-        try:
-            numeric_value = float(value)
-            if field == 'ABSUNIQUEID':
-                return int(numeric_value)
-            normalized = str(numeric_value)
-            return normalize_string(normalized, max_length)
-        except (TypeError, ValueError):
-            return 0
-
-    return normalize_string(value, max_length)
-
-
-# ---------------------- HELPER: EXTRACT PRESSURBAL AND PL1 ----------------------
-def extract_pressur_bal_and_pl1(product_details, kit_elements=None):
-    """
-    Extract PressurBal and PL1 values from subcodes or kit elements
+    Log time information to a text file
     
     Args:
-        product_details: Dictionary with Subcode01-10 values
-        kit_elements: List of kit element dictionaries from fetch_kit_elements()
-    
-    Returns:
-        tuple: (pressur_bal, pl1, packing_sequence)
+        log_type: 'capture_to_upload' or 'upload_duration'
+        start_time: Start time (datetime object or timestamp)
+        end_time: End time (datetime object or timestamp)
+        element_desc: Element description
+        production_order_code: Production order code
+        production_demand_code: Production demand code
+        customer_data: Customer data dictionary
+        folder_structure: Folder structure path
+        pallet_number: Pallet number
+        box_number: Box number
+        is_human_image: Boolean indicating if it's human image
+        status: Status of operation ('success', 'failed', 'cancelled')
     """
-    pressur_bal = None
-    pl1 = None
-    packing_sequence = None
     
-    print("\n[EXTRACT] Starting extraction...")
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
     
-    # ========== EXTRACT PL1 AND PACKINGSEQUENCE FROM KIT ELEMENTS ==========
-    if kit_elements and len(kit_elements) > 0:
-        print(f"[EXTRACT] Checking {len(kit_elements)} kit elements...")
-        for kit in kit_elements:
-            # Get PACKINGSEQUENCE value
-            packing_sequence = kit.get('PACKINGSEQUENCE', '').strip()
-            if packing_sequence and packing_sequence != 'N/A':
-                print(f"[EXTRACT] Found PACKINGSEQUENCE: '{packing_sequence}'")
-                
-                # Check for PL1, PL2, PL3, etc.
-                match = re.search(r'PL(\d+)', packing_sequence.upper())
-                if match:
-                    pl1 = match.group(1)
-                    print(f"[EXTRACT] PL1 extracted from PACKINGSEQUENCE: {pl1}")
-                    break
-                elif 'PL' in packing_sequence.upper():
-                    pl1 = '1'
-                    print(f"[EXTRACT] PL found (no number) from PACKINGSEQUENCE, default: {pl1}")
-                    break
-                else:
-                    # If no PL found, use the entire packing_sequence as box identifier
-                    print(f"[EXTRACT] Using PACKINGSEQUENCE as box identifier: {packing_sequence}")
-                    break
+    # Log filename based on date
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    log_filename = f"image_upload_times_{today}.txt"
+    log_filepath = os.path.join(logs_dir, log_filename)
     
-    # ========== EXTRACT PL1 FROM PRODUCT DETAILS (Fallback) ==========
-    if pl1 is None and product_details:
-        print("[EXTRACT] PL1 not in kit elements, checking product details...")
-        
-        # Check all Subcode fields
-        for i in range(1, 11):
-            subcode_key = f'Subcode{str(i).zfill(2)}'
-            subcode_value = product_details.get(subcode_key, '').strip()
-            
-            if subcode_value and subcode_value != 'N/A':
-                print(f"[EXTRACT] Checking {subcode_key}: '{subcode_value}'")
-                
-                # Check for PL pattern
-                if 'PL1' in subcode_value.upper():
-                    match = re.search(r'PL1\s*(\d+)?', subcode_value.upper())
-                    if match and match.group(1):
-                        pl1 = match.group(1)
-                    else:
-                        pl1 = '1'
-                    print(f"[EXTRACT] PL1 found in {subcode_key}: {pl1}")
-                    break
-                elif 'PL' in subcode_value.upper():
-                    match = re.search(r'PL\s*(\d+)', subcode_value.upper())
-                    if match:
-                        pl1 = match.group(1)
-                        print(f"[EXTRACT] PL found in {subcode_key}: {pl1}")
-                        break
-                # Check for plain digits <= 3 (legacy support)
-                elif subcode_value.isdigit() and len(subcode_value) <= 3:
-                    if pl1 is None:
-                        pl1 = subcode_value
-                        print(f"[EXTRACT] Numeric PL1 from {subcode_key}: {pl1}")
+    # Calculate duration
+    if isinstance(start_time, (int, float)):
+        # If timestamp
+        duration = end_time - start_time if isinstance(end_time, (int, float)) else None
+        start_datetime = datetime.datetime.fromtimestamp(start_time)
+        end_datetime = datetime.datetime.fromtimestamp(end_time)
+    else:
+        # If datetime objects
+        duration = (end_time - start_time).total_seconds() if end_time and start_time else None
+        start_datetime = start_time
+        end_datetime = end_time
     
-    # ========== EXTRACT PRESSURBAL FROM PRODUCT DETAILS ==========
-    if product_details:
-        # Check Subcode03 first (most common location)
-        subcode03 = product_details.get('Subcode03', '').strip()
-        print(f"[EXTRACT] Checking Subcode03 for PRESSURBAL: '{subcode03}'")
-        
-        if subcode03 and subcode03 != 'N/A':
-            if 'PRESSURBAL' in subcode03.upper():
-                match = re.search(r'PRESSURBAL\s*(\d+)', subcode03.upper())
-                if match:
-                    pressur_bal = match.group(1)
-                    print(f"[EXTRACT] PRESSURBAL found in Subcode03: {pressur_bal}")
-                else:
-                    pressur_bal = subcode03
-                    print(f"[EXTRACT] Using Subcode03 as pressur_bal: {pressur_bal}")
-            else:
-                pressur_bal = subcode03
-                print(f"[EXTRACT] Using Subcode03 as pressur_bal: {pressur_bal}")
-        
-        # If not found in Subcode03, check other subcodes
-        if pressur_bal is None:
-            for i in range(1, 11):
-                subcode_key = f'Subcode{str(i).zfill(2)}'
-                if subcode_key != 'Subcode03':
-                    subcode_value = product_details.get(subcode_key, '').strip()
-                    if subcode_value and subcode_value != 'N/A':
-                        if 'PRESSURBAL' in subcode_value.upper():
-                            match = re.search(r'PRESSURBAL\s*(\d+)', subcode_value.upper())
-                            if match:
-                                pressur_bal = match.group(1)
-                                print(f"[EXTRACT] PRESSURBAL found in {subcode_key}: {pressur_bal}")
-                                break
+    # Get clean values for logging
+    customer_name = customer_data.get('CustomerName', 'UNKNOWN').strip() if customer_data else 'UNKNOWN'
+    customer_po = customer_data.get('CustomerPO', 'NONE').strip() if customer_data else 'NONE'
     
-    # ========== EXTRACT PRESSURBAL FROM KIT ELEMENTS (Fallback) ==========
-    if pressur_bal is None and kit_elements:
-        print("[EXTRACT] Checking kit elements for pressure info...")
-        for kit in kit_elements:
-            element_desc = kit.get('ELEMENTDESC', '').strip()
-            if element_desc and 'PRESSURE' in element_desc.upper():
-                match = re.search(r'(\d+)', element_desc)
-                if match:
-                    pressur_bal = match.group(1)
-                    print(f"[EXTRACT] Pressure found in ELEMENTDESC: {pressur_bal}")
-                    break
+    # Clean values
+    customer_name_clean = re.sub(r'[^\w\s-]', '', customer_name).strip().upper()
+    customer_po_clean = customer_po.upper()
+    order_clean = production_order_code.strip().upper()
+    demand_clean = production_demand_code.strip().upper()
+    pallet_clean = str(pallet_number).strip().upper()
+    box_clean = str(box_number).strip().upper()
     
-    # ========== DO NOT APPLY DEFAULTS FOR MISSING VALUES ==========
-    if pressur_bal is None:
-        pressur_bal = ''
-        print("[EXTRACT] No PRESSURBAL found; leaving blank")
-
-    if pl1 is None:
-        pl1 = ''
-        print("[EXTRACT] No PL1 found; leaving blank")
-
-    # If no packing_sequence found, use pl1 as fallback only when pl1 is present
-    if not packing_sequence and pl1:
-        packing_sequence = pl1
+    # Extract PL value from folder structure or use default
+    pl_match = re.search(r'BOX_\d+_(\d+)', folder_structure) if folder_structure else None
+    pl_clean = pl_match.group(1) if pl_match else '1'
     
-    print(f"[EXTRACT] FINAL - PressurBal: {pressur_bal}, PL1: {pl1}, PackingSeq: {packing_sequence}\n")
-    return pressur_bal, pl1, packing_sequence
+    # Create log entry
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    image_type = "Human Image" if is_human_image else "Element Image"
+    
+    log_entry = f"""
+{'='*80}
+[{timestamp}] {log_type.upper()} - {image_type}
+{'='*80}
 
+Image Details:
+-------------
+Element Description: {element_desc}
+Image Type: {image_type}
+Status: {status.upper()}
 
+Order Information:
+----------------
+Order Code: {order_clean}
+Demand Code: {demand_clean}
 
+Customer Information:
+====================
+Customer: {customer_name_clean}
+PO: {customer_po_clean}
 
+Container Information:
+=====================
+Pallet: {pallet_clean}
+Box: {box_clean}
+PL: {pl_clean}
 
-def get_element_data(request, element_id):
-    """
-    Fetch dimensions from SKP_RCP
-    Fetch tolerance from SKP_KITUPLOAD
-    """
+Time Information:
+===============
+Start Time (Capture): {start_datetime.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if start_datetime else 'N/A'}
+End Time (Upload): {end_datetime.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if end_datetime else 'N/A'}
+Total Duration: {duration:.3f} seconds ({duration/60:.2f} minutes) if duration else 'N/A'
 
-    order_code = request.GET.get("order_code")
-    demand_code = request.GET.get("demand_code")
-    element_desc = request.GET.get("element_desc") or element_id
-    pallet_number = request.GET.get("pallet_number", "")
-    box_number = request.GET.get("box_number", "")
+System Information:
+==================
+Folder Path: {folder_structure}
+Log Created: {timestamp}
 
-    conn = None
+{'='*80}
 
+"""
+    
+    # Write to log file
     try:
-        conn = get_db_connection()
-
-        # ------------------ RCP DATA ------------------
-
-        rcp_table = get_rcp_table_name()
-        rcp_sql = f"""
-        SELECT
-            LENGHT1,
-            LENGHT2,
-            WIDTH1,
-            WIDTH2,
-            THICKNESS,
-            ROOTSIDEANGLEA2,
-            TIPSIDEANGLEA1,
-            TIPSIDEANGLEA2,
-            ANGLEB1,
-            ANGLEB2,
-            ROOTSIDEANGLEC1,
-            ROOTSIDEANGLEC2,
-            TIPSIDEANGLEC1,
-            TIPSIDEANGLEC2,
-            T1,
-            T2
-        FROM {rcp_table}
-        WHERE ELEMENTDESC=?
-        """
-
-        stmt = ibm_db.prepare(conn, rcp_sql)
-        ibm_db.bind_param(stmt, 1, element_desc)
-        ibm_db.execute(stmt)
-
-        rcp_row = ibm_db.fetch_assoc(stmt)
-
-        if not rcp_row:
-            rcp_row = {}
-
-        element_data = {}
-
-        fields = [
-            "LENGHT1",
-            "LENGHT2",
-            "WIDTH1",
-            "WIDTH2",
-            "THICKNESS",
-            "ROOTSIDEANGLEA2",
-            "TIPSIDEANGLEA1",
-            "TIPSIDEANGLEA2",
-            "ANGLEB1",
-            "ANGLEB2",
-            "ROOTSIDEANGLEC1",
-            "ROOTSIDEANGLEC2",
-            "TIPSIDEANGLEC1",
-            "TIPSIDEANGLEC2",
-            "T1",
-            "T2"
-        ]
-
-        for field in fields:
-            value = rcp_row.get(field)
-
-            if value is None:
-                value = rcp_row.get(field.upper())
-
-            if isinstance(value, str):
-                value = value.strip()
-
-            element_data[field] = value
-
-        # ------------------ KITUPLOAD TOLERANCE ------------------
-
-        kitupload_sql = """
-        SELECT
-            LENGHT1,
-            LENGHT2,
-            WIDTH1,
-            WIDTH2,
-            THICKNESS,
-            ROOTSIDEANGLEA2,
-            TIPSIDEANGLEA1,
-            TIPSIDEANGLEA2,
-            ANGLEB1,
-            ANGLEB2,
-            ROOTSIDEANGLEC1,
-            ROOTSIDEANGLEC2,
-            TIPSIDEANGLEC1,
-            TIPSIDEANGLEC2,
-            T1,
-            T2,
-            TOLLENGHT1,
-            TOLLENGHT2,
-            TOLWIDTH1,
-            TOLWIDTH2,
-            TOLTHICKNESS,
-            TOLROOTSIDEANGLEA2,
-            TOLTIPSIDEANGLEA1,
-            TOLTIPSIDEANGLEA2,
-            TOLANGLEB1,
-            TOLANGLEB2,
-            TOLROOTSIDEANGLEC1,
-            TOLROOTSIDEANGLEC2,
-            TOLTIPSIDEANGLEC1,
-            TOLTIPSIDEANGLEC2,
-            TOLT1,
-            TOLT2
-        FROM SKP_KITUPLOAD
-        WHERE ELEMENTDESC = ?
-        """
-
-        stmt2 = ibm_db.prepare(conn, kitupload_sql)
-        ibm_db.bind_param(stmt2, 1, normalize_string(element_desc, 100))
-        ibm_db.execute(stmt2)
-
-        tol_row = ibm_db.fetch_assoc(stmt2)
-
-        tolerance_data = {}
-        baseline_data = {}
-
-        baseline_fields = [
-            "LENGHT1",
-            "LENGHT2",
-            "WIDTH1",
-            "WIDTH2",
-            "THICKNESS",
-            "ROOTSIDEANGLEA2",
-            "TIPSIDEANGLEA1",
-            "TIPSIDEANGLEA2",
-            "ANGLEB1",
-            "ANGLEB2",
-            "ROOTSIDEANGLEC1",
-            "ROOTSIDEANGLEC2",
-            "TIPSIDEANGLEC1",
-            "TIPSIDEANGLEC2",
-            "T1",
-            "T2"
-        ]
-
-        tol_fields = [
-            "TOLLENGHT1",
-            "TOLLENGHT2",
-            "TOLWIDTH1",
-            "TOLWIDTH2",
-            "TOLTHICKNESS",
-            "TOLROOTSIDEANGLEA2",
-            "TOLTIPSIDEANGLEA1",
-            "TOLTIPSIDEANGLEA2",
-            "TOLANGLEB1",
-            "TOLANGLEB2",
-            "TOLROOTSIDEANGLEC1",
-            "TOLROOTSIDEANGLEC2",
-            "TOLTIPSIDEANGLEC1",
-            "TOLTIPSIDEANGLEC2",
-            "TOLT1",
-            "TOLT2"
-        ]
-
-        if tol_row:
-            for field in baseline_fields:
-                value = tol_row.get(field)
-                if value is None:
-                    value = tol_row.get(field.upper())
-                if isinstance(value, str):
-                    value = value.strip()
-                baseline_data[field] = value
-
-            for field in tol_fields:
-                value = tol_row.get(field)
-                if value is None:
-                    value = tol_row.get(field.upper())
-                if isinstance(value, str):
-                    value = value.strip()
-                tolerance_data[field] = value
-                
-
-        return JsonResponse({
-            "status": "success",
-            "element_data": element_data,
-            "baseline_data": baseline_data,
-            "tolerance_data": tolerance_data,
-        })
-
+        with open(log_filepath, 'a', encoding='utf-8') as log_file:
+            log_file.write(log_entry)
+        print(f"[TIME LOG] Successfully logged to: {log_filepath}")
+        return True
     except Exception as e:
-
-        print(e)
-
-        return JsonResponse({
-
-            "status": "error",
-
-            "message": str(e)
-
-        })
-
-    finally:
-
-        if conn:
-
-            ibm_db.close(conn)
-
-# def get_element_data(request, element_id):
-#     """Fetch element data from SKP_RCP table"""
-
-#     order_code = request.GET.get('order_code')
-#     demand_code = request.GET.get('demand_code')
-#     element_desc = request.GET.get('element_desc') or element_id
-
-#     conn = None
-#     try:
-#         conn = get_db_connection()
-
-#         sql = """
-#             SELECT
-#                 LENGHT1,
-#                 LENGHT2,
-#                 WIDTH1,
-#                 WIDTH2,
-#                 THICKNESS,
-#                 ROOTSIDEANGLEA2,
-#                 TIPSIDEANGLEA1,
-#                 TIPSIDEANGLEA2,
-#                 ANGLEB1,
-#                 ANGLEB2,
-#                 ROOTSIDEANGLEC1,
-#                 ROOTSIDEANGLEC2,
-#                 TIPSIDEANGLEC1,
-#                 TIPSIDEANGLEC2,
-#                 T1,
-#                 T2
-#             FROM SKP_RCP
-#             WHERE ELEMENTDESC = ?
-#         """
-
-#         stmt = ibm_db.prepare(conn, sql)
-#         ibm_db.bind_param(stmt, 1, element_desc)
-#         ibm_db.execute(stmt)
-
-#         row = ibm_db.fetch_assoc(stmt)
-
-#         if not row:
-#             return JsonResponse({
-#                 "status": "error",
-#                 "message": "No data found in SKP_RCP"
-#             })
-
-#         element_data = {
-#             "LENGHT1": row.get("LENGHT1"),
-#             "LENGHT2": row.get("LENGHT2"),
-#             "WIDTH1": row.get("WIDTH1"),
-#             "WIDTH2": row.get("WIDTH2"),
-#             "THICKNESS": row.get("THICKNESS"),
-#             "ROOTSIDEANGLEA2": row.get("ROOTSIDEANGLEA2"),
-#             "TIPSIDEANGLEA1": row.get("TIPSIDEANGLEA1"),
-#             "TIPSIDEANGLEA2": row.get("TIPSIDEANGLEA2"),
-#             "ANGLEB1": row.get("ANGLEB1"),
-#             "ANGLEB2": row.get("ANGLEB2"),
-#             "ROOTSIDEANGLEC1": row.get("ROOTSIDEANGLEC1"),
-#             "ROOTSIDEANGLEC2": row.get("ROOTSIDEANGLEC2"),
-#             "TIPSIDEANGLEC1": row.get("TIPSIDEANGLEC1"),
-#             "TIPSIDEANGLEC2": row.get("TIPSIDEANGLEC2"),
-#             "T1": row.get("T1"),
-#             "T2": row.get("T2"),
-#         }
-
-#         return JsonResponse({
-#             "status": "success",
-#             "element_data": element_data
-#         })
-
-#     except Exception as e:
-#         return JsonResponse({
-#             "status": "error",
-#             "message": str(e)
-#         })
-
-#     finally:
-#         if conn:
-#             ibm_db.close(conn)
-
-
-
-# ---------------------- SAVE ELEMENT DIMENSIONS (NEW) ----------------------
-def fetch_kitupload_baseline_data(element_desc, order_code, demand_code, pallet_number, box_number):
-    """Fetch baseline values from SKP_KITUPLOAD for an element."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        query = """
-            SELECT
-                LENGHT1, LENGHT2, WIDTH1, WIDTH2, THICKNESS,
-                ROOTSIDEANGLEA2, TIPSIDEANGLEA1, TIPSIDEANGLEA2,
-                ANGLEB1, ANGLEB2, ROOTSIDEANGLEC1, ROOTSIDEANGLEC2,
-                TIPSIDEANGLEC1, TIPSIDEANGLEC2, T1, T2
-            FROM SKP_KITUPLOAD
-            WHERE ELEMENTDESC = ?
-              AND PALLETNUMBER = ?
-              AND BOXNUMBER = ?
-        """
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, normalize_string(element_desc, 100))
-        ibm_db.bind_param(stmt, 2, normalize_string(pallet_number or '', 100))
-        ibm_db.bind_param(stmt, 3, normalize_string(box_number or '', 50))
-        ibm_db.execute(stmt)
-
-        row = ibm_db.fetch_assoc(stmt)
-        if not row:
-            return None
-
-        baseline_data = {}
-        fields = [
-            'LENGHT1', 'LENGHT2', 'WIDTH1', 'WIDTH2', 'THICKNESS',
-            'ROOTSIDEANGLEA2', 'TIPSIDEANGLEA1', 'TIPSIDEANGLEA2',
-            'ANGLEB1', 'ANGLEB2', 'ROOTSIDEANGLEC1', 'ROOTSIDEANGLEC2',
-            'TIPSIDEANGLEC1', 'TIPSIDEANGLEC2', 'T1', 'T2'
-        ]
-
-        for field in fields:
-            value = row.get(field)
-            if value is None:
-                value = row.get(field.upper())
-            if value is None:
-                value = row.get(field.lower())
-            if value is not None and isinstance(value, str) and value.strip() == '':
-                value = None
-            baseline_data[field] = value
-
-        return baseline_data
-    except Exception as exc:
-        print(f"Error fetching RCP baseline data: {exc}")
-        return None
-    finally:
-        if conn is not None:
-            try:
-                ibm_db.close(conn)
-            except Exception:
-                pass
-
-
-
-
-
-
-def fetch_kitupload_tolerance_data(element_desc, order_code, demand_code, pallet_number, box_number):
-    """Fetch tolerance values from SKP_KITUPLOAD for an element."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        query = """
-            SELECT
-                TOLLENGHT1, TOLLENGHT2, TOLWIDTH1, TOLWIDTH2, TOLTHICKNESS,
-                TOLROOTSIDEANGLEA2, TOLTIPSIDEANGLEA1, TOLTIPSIDEANGLEA2,
-                TOLANGLEB1, TOLANGLEB2, TOLROOTSIDEANGLEC1, TOLROOTSIDEANGLEC2,
-                TOLTIPSIDEANGLEC1, TOLTIPSIDEANGLEC2, TOLT1, TOLT2
-            FROM SKP_KITUPLOAD
-            WHERE ELEMENTDESC = ?
-              AND PALLETNUMBER = ?
-              AND BOXNUMBER = ?
-        """
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, normalize_string(element_desc, 100))
-        ibm_db.bind_param(stmt, 2, normalize_string(pallet_number or '', 100))
-        ibm_db.bind_param(stmt, 3, normalize_string(box_number or '', 50))
-        ibm_db.execute(stmt)
-
-        row = ibm_db.fetch_assoc(stmt)
-        if not row:
-            return None
-
-        tolerance_data = {}
-        fields = [
-            'TOLLENGHT1', 'TOLLENGHT2', 'TOLWIDTH1', 'TOLWIDTH2', 'TOLTHICKNESS',
-            'TOLROOTSIDEANGLEA2', 'TOLTIPSIDEANGLEA1', 'TOLTIPSIDEANGLEA2',
-            'TOLANGLEB1', 'TOLANGLEB2', 'TOLROOTSIDEANGLEC1', 'TOLROOTSIDEANGLEC2',
-            'TOLTIPSIDEANGLEC1', 'TOLTIPSIDEANGLEC2', 'TOLT1', 'TOLT2'
-        ]
-
-        for field in fields:
-            value = row.get(field)
-            if value is None:
-                value = row.get(field.upper())
-            if value is None:
-                value = row.get(field.lower())
-            if value is not None and isinstance(value, str) and value.strip() == '':
-                value = None
-            tolerance_data[field] = value
-
-        return tolerance_data
-    except Exception as exc:
-        print(f"Error fetching KITUPLOAD tolerance data: {exc}")
-        return None
-    finally:
-        if conn is not None:
-            try:
-                ibm_db.close(conn)
-            except Exception:
-                pass
-
-
-def fetch_kitupload_full_row(element_desc, pallet_number=None, box_number=None):
-    """Fetch the full non-tolerance row from SKP_KITUPLOAD for an element."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        columns = [
-            'COMPANYCODE', 'PARTDESC', 'TOTALPCS', 'ITEMTYPECODE',
-            'DECOSUBCODE01', 'DECOSUBCODE02', 'DECOSUBCODE03', 'DECOSUBCODE04',
-            'DECOSUBCODE05', 'DECOSUBCODE06', 'DECOSUBCODE07', 'DECOSUBCODE08',
-            'DECOSUBCODE09', 'DECOSUBCODE10', 'CODE', 'ELEMENTDESC', 'BOXNUMBER',
-            'ELEMENTSEQ', 'FBGFABRIC', 'CUTTYPE', 'PALLETNUMBER', 'PAPERTUBE',
-            'WEIGHTUNITOFMEASURECODE', 'NETWEIGHT', 'GROSSWEIGHT', 'CREATIONDATETIME',
-            'CREATIONUSER', 'ABSUNIQUEID', 'BOXSEQUENCE', 'PACKINGSEQUENCE',
-            'PLACEMENTINBOX', 'LENGHT1', 'LENGHT2', 'WIDTH1', 'WIDTH2', 'THICKNESS',
-            'ROOTSIDEANGLEA2', 'TIPSIDEANGLEA1', 'TIPSIDEANGLEA2', 'ANGLEB1', 'ANGLEB2',
-            'ROOTSIDEANGLEC1', 'ROOTSIDEANGLEC2', 'TIPSIDEANGLEC1', 'TIPSIDEANGLEC2', 'T1', 'T2'
-        ]
-        query = f"""
-            SELECT {', '.join(columns)}
-            FROM SKP_KITUPLOAD
-            WHERE ELEMENTDESC = ?
-              AND PALLETNUMBER = ?
-              AND BOXNUMBER = ?
-        """
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, normalize_string(element_desc, 100))
-        ibm_db.bind_param(stmt, 2, normalize_string(pallet_number or '', 100))
-        ibm_db.bind_param(stmt, 3, normalize_string(box_number or '', 50))
-        ibm_db.execute(stmt)
-
-        row = ibm_db.fetch_assoc(stmt)
-        if not row:
-            return None
-
-        data = {}
-        for field in columns:
-            value = row.get(field)
-            if value is None:
-                value = row.get(field.upper())
-            if value is None:
-                value = row.get(field.lower())
-            if value is not None and isinstance(value, str) and value.strip() == '':
-                value = None
-            data[field] = value
-        return data
-    except Exception as exc:
-        print(f"Error fetching KITUPLOAD full row: {exc}")
-        return None
-    finally:
-        if conn is not None:
-            try:
-                ibm_db.close(conn)
-            except Exception:
-                pass
-
-
-def get_rcp_table_name():
-    """Resolve the RCP table name to use for reads and writes."""
-    preferred_tables = ['SKP_RCP', 'KIT_RCP']
-    for table_name in preferred_tables:
-        conn = None
-        try:
-            conn = get_db_connection()
-            query = f"SELECT 1 FROM {table_name} WHERE 1 = 0"
-            stmt = ibm_db.prepare(conn, query)
-            ibm_db.execute(stmt)
-            return table_name
-        except Exception:
-            continue
-        finally:
-            if conn is not None:
-                try:
-                    ibm_db.close(conn)
-                except Exception:
-                    pass
-    return 'SKP_RCP'
-
-
-def rcp_row_exists(element_desc):
-    """Check whether an RCP row already exists for the element."""
-    table_name = get_rcp_table_name()
-    conn = None
-    try:
-        conn = get_db_connection()
-        query = f"SELECT 1 FROM {table_name} WHERE ELEMENTDESC = ?"
-        stmt = ibm_db.prepare(conn, query)
-        ibm_db.bind_param(stmt, 1, normalize_string(element_desc, 100))
-        ibm_db.execute(stmt)
-        row = ibm_db.fetch_assoc(stmt)
-        return row is not None
-    except Exception as exc:
-        print(f"Error checking RCP row existence: {exc}")
+        print(f"[TIME LOG ERROR] Failed to write log: {e}")
         return False
-    finally:
-        if conn is not None:
-            try:
-                ibm_db.close(conn)
-            except Exception:
-                pass
-
-
-def save_element_dimensions(request):
-    """Save dimension values to SKP_RCP table"""
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': 'Method not allowed'})
+ 
+def log_time_to_text_file(log_data):
+    """
+    Save time tracking information to a text file
     
+    Args:
+        log_data: Dictionary containing all timing information
+    """
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    # Create filename with date
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    log_filename = f"capture_upload_times_{today}.txt"
+    log_filepath = os.path.join(logs_dir, log_filename)
+    
+    # Format the log entry
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    log_entry = f"""
+{'='*80}
+LOG ENTRY: {timestamp}
+{'='*80}
+
+IMAGE DETAILS:
+--------------
+Element Description: {log_data.get('element_desc', 'N/A')}
+Image Type: {log_data.get('image_type', 'N/A')}
+Status: {log_data.get('status', 'N/A')}
+
+ORDER INFORMATION:
+-----------------
+Order Code: {log_data.get('order_code', 'N/A')}
+Demand Code: {log_data.get('demand_code', 'N/A')}
+
+CUSTOMER INFORMATION:
+====================
+Customer: {log_data.get('customer_name', 'N/A')}
+PO: {log_data.get('customer_po', 'N/A')}
+
+CONTAINER INFORMATION:
+=====================
+Pallet: {log_data.get('pallet_number', 'N/A')}
+Box: {log_data.get('box_number', 'N/A')}
+PL: {log_data.get('pl_value', 'N/A')}
+
+TIME INFORMATION:
+================
+Capture Start Time: {log_data.get('capture_start_time', 'N/A')}
+Back Image Capture Time: {log_data.get('back_capture_time', 'N/A')}
+Front Image Capture Time: {log_data.get('front_capture_time', 'N/A')}
+Upload Start Time: {log_data.get('upload_start_time', 'N/A')}
+Upload Complete Time: {log_data.get('upload_complete_time', 'N/A')}
+
+DURATIONS:
+----------
+Total Duration (Capture to Upload): {log_data.get('total_duration', 'N/A')} seconds
+Back Capture Duration: {log_data.get('back_capture_duration', 'N/A')} seconds
+Front Capture Duration: {log_data.get('front_capture_duration', 'N/A')} seconds
+Between Captures Duration: {log_data.get('between_captures_duration', 'N/A')} seconds
+Upload Processing Duration: {log_data.get('upload_duration', 'N/A')} seconds
+
+SYSTEM INFORMATION:
+==================
+Folder Path: {log_data.get('folder_path', 'N/A')}
+IP Address: {log_data.get('ip_address', 'N/A')}
+User Agent: {log_data.get('user_agent', 'N/A')}
+
+{'='*80}
+
+"""
+    
+    # Write to log file
     try:
-        data = json.loads(request.body)
-        element_id = data.get('element_id')
-        element_desc = data.get('element_desc') or element_id
-        order_code = data.get('order_code')
-        demand_code = data.get('demand_code')
-        pallet_number = data.get('pallet_number')
-        box_number = data.get('box_number')
-        dimensions = data.get('dimensions', {})
-        
-        if not element_desc or not order_code or not demand_code:
-            return JsonResponse({'status': 'error', 'message': 'Missing required fields'})
-        
-        if not dimensions:
-            return JsonResponse({'status': 'error', 'message': 'No dimensions to save'})
-
-        baseline_data = fetch_kitupload_baseline_data(element_desc, order_code, demand_code, pallet_number, box_number) or {}
-        tolerance_data = fetch_kitupload_tolerance_data(element_desc, order_code, demand_code, pallet_number, box_number) or {}
-        full_row = fetch_kitupload_full_row(element_desc, pallet_number, box_number) or {}
-
-        allowed_columns = [
-            'LENGHT1', 'LENGHT2', 'WIDTH1', 'WIDTH2', 'THICKNESS',
-            'ROOTSIDEANGLEA2', 'TIPSIDEANGLEA1', 'TIPSIDEANGLEA2',
-            'ANGLEB1', 'ANGLEB2', 'ROOTSIDEANGLEC1', 'ROOTSIDEANGLEC2',
-            'TIPSIDEANGLEC1', 'TIPSIDEANGLEC2', 'T1', 'T2'
-        ]
-        tolerance_columns = [
-            'TOLLENGHT1', 'TOLLENGHT2', 'TOLWIDTH1', 'TOLWIDTH2', 'TOLTHICKNESS',
-            'TOLROOTSIDEANGLEA2', 'TOLTIPSIDEANGLEA1', 'TOLTIPSIDEANGLEA2',
-            'TOLANGLEB1', 'TOLANGLEB2', 'TOLROOTSIDEANGLEC1', 'TOLROOTSIDEANGLEC2',
-            'TOLTIPSIDEANGLEC1', 'TOLTIPSIDEANGLEC2', 'TOLT1', 'TOLT2'
-        ]
-        insert_columns_list = [
-            'COMPANYCODE', 'PRODUCTIONORDERCODE', 'PRODUCTIONDEMANDCODE', 'ITEMTYPECODE',
-            'DECOSUBCODE01', 'DECOSUBCODE02', 'DECOSUBCODE03', 'DECOSUBCODE04',
-            'DECOSUBCODE05', 'DECOSUBCODE06', 'DECOSUBCODE07', 'DECOSUBCODE08',
-            'DECOSUBCODE09', 'DECOSUBCODE10', 'CODE', 'ELEMENTDESC', 'BOXNUMBER',
-            'ELEMENTSEQ', 'FBGFABRIC', 'CUTTYPE', 'PALLETNUMBER', 'PAPERTUBE',
-            'WEIGHTUNITOFMEASURECODE', 'NETWEIGHT', 'GROSSWEIGHT', 'CREATIONDATETIME',
-            'CREATIONUSER', 'ABSUNIQUEID', 'BOXSEQUENCE', 'PACKINGSEQUENCE',
-            'PLACEMENTINBOX', 'LENGHT1', 'LENGHT2', 'WIDTH1', 'WIDTH2', 'THICKNESS',
-            'ROOTSIDEANGLEA2', 'TIPSIDEANGLEA1', 'TIPSIDEANGLEA2', 'ANGLEB1', 'ANGLEB2',
-            'ROOTSIDEANGLEC1', 'ROOTSIDEANGLEC2', 'TIPSIDEANGLEC1', 'TIPSIDEANGLEC2', 'T1', 'T2'
-        ] + tolerance_columns
-
-        def resolve_insert_value(field):
-            if field == 'ELEMENTDESC':
-                return element_desc
-            if field == 'PRODUCTIONORDERCODE':
-                return order_code
-            if field == 'PRODUCTIONDEMANDCODE':
-                return demand_code
-            if field == 'BOXNUMBER':
-                return box_number
-            if field == 'PALLETNUMBER':
-                return pallet_number
-            if field in tolerance_columns:
-                source_field = field.replace('TOL', '')
-                if source_field in dimensions:
-                    return dimensions[source_field]
-                value = tolerance_data.get(field)
-                if value is not None:
-                    return value
-                return full_row.get(field)
-            if field in dimensions and field in allowed_columns:
-                return dimensions[field]
-            if field in full_row:
-                return full_row.get(field)
-            if field in baseline_data:
-                return baseline_data[field]
-            return None
-
-        table_name = get_rcp_table_name()
-        table_columns = get_table_columns(table_name)
-        table_nullability = get_table_nullability(table_name)
-        if not table_columns:
-            table_columns = {
-                'ELEMENTDESC', 'BOXNUMBER', 'PALLETNUMBER', 'ELEMENTSEQ', 'PACKINGSEQUENCE'
-            } | set(allowed_columns) | set(tolerance_columns)
-        else:
-            table_columns = set(table_columns)
-
-        not_null_columns = {
-            col for col, nulls in table_nullability.items() if nulls == 'N'
-        }
-        not_null_columns |= {
-            'COMPANYCODE', 'PRODUCTIONORDERCODE', 'PRODUCTIONDEMANDCODE',
-            'ITEMTYPECODE', 'ABSUNIQUEID'
-        }
-
-        def build_insert_values():
-            insert_columns = []
-            insert_values = []
-            for field in sorted(table_columns):
-                if field not in insert_columns_list and field not in not_null_columns:
-                    continue
-
-                value = resolve_insert_value(field)
-                if value is None and field not in not_null_columns:
-                    continue
-
-                insert_columns.append(field)
-                insert_values.append(get_insert_value(field, value))
-
-            return insert_columns, insert_values
-
-        update_columns = []
-        update_values = []
-
-        for field in allowed_columns:
-            if field not in dimensions:
-                continue
-
-            raw_value = dimensions[field]
-            try:
-                value = float(raw_value)
-            except (TypeError, ValueError):
-                return JsonResponse({'status': 'error', 'message': f'Invalid numeric value for {field}'})
-
-            baseline = baseline_data.get(field)
-            tolerance_key = f'TOL{field}'
-            tolerance = tolerance_data.get(tolerance_key)
-
-            if baseline is not None and tolerance is not None:
-                try:
-                    baseline_value = float(baseline)
-                    tolerance_value = float(tolerance)
-                except (TypeError, ValueError):
-                    return JsonResponse({'status': 'error', 'message': f'Invalid baseline/tolerance for {field}'})
-
-                min_allowed = baseline_value - tolerance_value
-                max_allowed = baseline_value + tolerance_value
-                if value < min_allowed or value > max_allowed:
-                    return JsonResponse({
-                        'status': 'error',
-                        'message': f'{field} value {value} is outside allowed range {min_allowed} - {max_allowed}'
-                    })
-
-            update_columns.append(f"{field} = ?")
-            update_values.append(normalize_string(raw_value, 10))
-            tol_field = f'TOL{field}'
-            if tol_field in table_columns:
-                update_columns.append(f"{tol_field} = ?")
-                update_values.append(normalize_string(raw_value, 10))
-
-        if not update_columns:
-            return JsonResponse({'status': 'error', 'message': 'No valid dimension fields found'})
-
-        conn = get_db_connection()
-        try:
-            existing_row = rcp_row_exists(element_desc)
-        except Exception:
-            existing_row = True
-
-        if existing_row:
-            query = f"""
-                UPDATE {table_name}
-                SET {', '.join(update_columns)}
-                WHERE ELEMENTDESC = ?
-            """
-            update_values.append(normalize_string(element_desc, 100))
-        else:
-            insert_columns = []
-            insert_values = []
-            required_not_null = {
-                'COMPANYCODE', 'PRODUCTIONORDERCODE', 'PRODUCTIONDEMANDCODE',
-                'ITEMTYPECODE', 'ABSUNIQUEID'
-            }
-            for field in insert_columns_list:
-                if field not in table_columns:
-                    continue
-
-                value = resolve_insert_value(field)
-                if value is None and field not in required_not_null:
-                    continue
-
-                insert_columns.append(field)
-                insert_values.append(get_insert_value(field, value))
-
-            query = f"""
-                INSERT INTO {table_name} ({', '.join(insert_columns)})
-                VALUES ({', '.join(['?'] * len(insert_columns))})
-            """
-            update_values = insert_values
-
-        stmt = ibm_db.prepare(conn, query)
-
-        for index, value in enumerate(update_values, start=1):
-            ibm_db.bind_param(stmt, index, value)
-
-        ibm_db.execute(stmt)
-        rows_updated = None
-        try:
-            if hasattr(ibm_db, 'num_rows'):
-                rows_updated = ibm_db.num_rows(stmt)
-        except Exception as num_exc:
-            print(f"Row count warning: {num_exc}")
-
-        if existing_row and rows_updated == 0:
-            print(f"No existing row updated for ELEMENTDESC={element_desc}; inserting instead.")
-            insert_columns, insert_values = build_insert_values()
-
-            insert_query = f"""
-                INSERT INTO {table_name} ({', '.join(insert_columns)})
-                VALUES ({', '.join(['?'] * len(insert_columns))})
-            """
-            stmt = ibm_db.prepare(conn, insert_query)
-            for index, value in enumerate(insert_values, start=1):
-                ibm_db.bind_param(stmt, index, value)
-            ibm_db.execute(stmt)
-
-        try:
-            if hasattr(ibm_db, 'commit'):
-                ibm_db.commit(conn)
-        except Exception as commit_exc:
-            print(f"Commit warning: {commit_exc}")
-        try:
-            ibm_db.close(conn)
-        except Exception as close_exc:
-            print(f"Close warning: {close_exc}")
-
-        print(f"Dimensions inserted into SKP_RCP for element {element_id}: {dimensions}")
-
-        return JsonResponse({'status': 'success', 'message': 'Dimensions saved successfully'})
-        
+        with open(log_filepath, 'a', encoding='utf-8') as log_file:
+            log_file.write(log_entry)
+        print(f"[TIME LOG] Successfully saved to: {log_filepath}")
+        return True
     except Exception as e:
-        print(f"Error saving dimensions: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return JsonResponse({'status': 'error', 'message': str(e)})
+        print(f"[TIME LOG ERROR] Failed to write log: {e}")
+        return False 
+ 
 
-
-# ---------------------- FETCH DATA ----------------------
-def fetch_data(request):
-    if request.method == 'POST':
-        production_order_code = request.POST.get('production_order_code', '').strip()
-        production_demand_code = request.POST.get('production_demand_code', '').strip()
-        pallet_number = request.POST.get('pallet_number', '1').strip()
-        box_number = request.POST.get('box_number', '1').strip()
-
-        customer_data = fetch_customer_data(production_order_code, production_demand_code)
-        product_details = fetch_product_details(production_order_code, production_demand_code)
-        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
-        
-        # Extract PressurBal, PL1 and packing_sequence with kit_elements
-        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
-        print(f"Extracted PressurBal: {pressur_bal}, PL1: {pl1}, PackingSeq: {packing_sequence}")
-        
-        if product_details:
-            product_details['PressurBal'] = pressur_bal
-            product_details['PL1'] = pl1
-            product_details['PackingSequence'] = packing_sequence
-
-       
-
-        context = {
-            'customer_data': customer_data if customer_data else {
-                'CustomerName': 'Not Available',
-                'CustomerPO': 'Not Available',
-                'CustomerCode': 'Not Available'
-            },
-            'product_details': product_details if product_details else {
-                'ItemType': 'Not Available',
-                'Subcode01': 'N/A',
-                'Subcode02': 'N/A',
-                'Subcode03': 'N/A',
-                'Subcode04': 'N/A',
-                'Subcode05': 'N/A',
-                'PressurBal': '',
-                'PL1': '',
-                'PackingSequence': ''
-            },
-            'kit_elements': kit_elements or [],
-            'production_order_code': production_order_code,
-            'production_demand_code': production_demand_code,
-            'pallet_number': pallet_number,
-            'box_number': box_number,
-            'packing_sequence': packing_sequence,
-            'MEDIA_URL': settings.MEDIA_URL
-        }
-
-        if not any([customer_data, product_details, kit_elements]):
-            context['error'] = "No data found for the provided codes"
-            return render(request, 'fetch_data.html', context)
-
-        return render(request, 'view_data.html', context)
-
-    return render(request, 'fetch_data.html')
-
-
-# ---------------------- VIEW DATA ----------------------
-def view_data(request):
-    if request.method == 'POST':
-        production_order_code = request.POST.get('production_order_code', '').strip()
-        production_demand_code = request.POST.get('production_demand_code', '').strip()
-        pallet_number = request.POST.get('pallet_number', '1').strip()
-        box_number = request.POST.get('box_number', '1').strip()
-
-        customer_data = fetch_customer_data(production_order_code, production_demand_code)
-        product_details = fetch_product_details(production_order_code, production_demand_code)
-        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
-        
-        # Extract PressurBal, PL1 and packing_sequence with kit_elements
-        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
-        
-        if product_details:
-            product_details['PressurBal'] = pressur_bal
-            product_details['PL1'] = pl1
-            product_details['PackingSequence'] = packing_sequence
-
-        
-        
-        # Process each element's human image separately
-        for element in kit_elements:
-            current_ply = element.get('ELEMENTDESC', '').strip()
+# ---------------------- TEST LOGGING ENDPOINT ----------------------
+@csrf_exempt
+def test_logging(request):
+    """Test endpoint to verify logging is working"""
+    if request.method == 'GET':
+        try:
+            test_log = log_capture_time_simple(
+                element_desc="TEST_IMAGE",
+                order_code="TEST_ORDER",
+                demand_code="TEST_DEMAND",
+                pallet_number="1",
+                box_number="1",
+                capture_start=datetime.datetime.now().isoformat(),
+                upload_complete=datetime.datetime.now().isoformat(),
+                status="test",
+                extra_data="This is a test log entry"
+            )
             
+            if test_log:
+                return JsonResponse({'status': 'success', 'message': 'Test log created successfully'})
+            else:
+                return JsonResponse({'status': 'error', 'message': 'Failed to create log'}, status=500)
+        except Exception as e:
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+    return JsonResponse({'status': 'error', 'message': 'Use GET request'}, status=405)
+
+import json    
+    
+@csrf_exempt
+def save_timing_log_endpoint(request):
+    """Simple endpoint to save timing log from frontend"""
+    if request.method == 'POST':
+        try:
+            # Try to get JSON data
+            try:
+                data = json.loads(request.body)
+            except:
+                data = request.POST.dict()
             
+            # Extract data
+            element_desc = data.get('element_desc', 'Unknown')
+            order_code = data.get('order_code', '')
+            demand_code = data.get('demand_code', '')
+            pallet_number = data.get('pallet_number', '')
+            box_number = data.get('box_number', '')
+            capture_start = data.get('capture_start_time', '')
+            upload_complete = data.get('upload_complete_time', datetime.datetime.now().isoformat())
+            status = data.get('status', 'completed')
+            
+            # Log to text file
+            log_capture_time_simple(
+                element_desc=element_desc,
+                order_code=order_code,
+                demand_code=demand_code,
+                pallet_number=pallet_number,
+                box_number=box_number,
+                capture_start=capture_start,
+                upload_complete=upload_complete,
+                status=status,
+                extra_data=data.get('extra_data', '')
+            )
+            
+            return JsonResponse({'status': 'success', 'message': 'Log saved'})
+        except Exception as e:
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+    
+    return JsonResponse({'status': 'error', 'message': 'Invalid method'}, status=405)
+    
 
-        context = {
-            'customer_data': customer_data if customer_data else {
-                'CustomerName': 'Not Available',
-                'CustomerPO': 'Not Available',
-                'CustomerCode': 'Not Available'
-            },
-            'product_details': product_details if product_details else {
-                'ItemType': 'Not Available',
-                'Subcode01': 'N/A',
-                'Subcode02': 'N/A',
-                'Subcode03': 'N/A',
-                'Subcode04': 'N/A',
-                'Subcode05': 'N/A',
-                'PressurBal': '',
-                'PL1': '',
-                'PackingSequence': ''
-            },
-            'kit_elements': kit_elements or [],
-            'production_order_code': production_order_code,
-            'production_demand_code': production_demand_code,
-            'pallet_number': pallet_number,
-            'box_number': box_number,
-            'packing_sequence': packing_sequence,
-            'MEDIA_URL': settings.MEDIA_URL
-        }
-
-        return render(request, 'view_data.html', context)
-
-    # GET request handling (same as POST but with GET parameters)
-    production_order_code = request.GET.get('production_order_code', '').strip()
-    production_demand_code = request.GET.get('production_demand_code', '').strip()
-    pallet_number = request.GET.get('pallet_number', '1').strip()
-    box_number = request.GET.get('box_number', '1').strip()
-
-    if production_order_code and production_demand_code:
-        customer_data = fetch_customer_data(production_order_code, production_demand_code)
-        product_details = fetch_product_details(production_order_code, production_demand_code)
-        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
-        
-        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
-        
-        if product_details:
-            product_details['PressurBal'] = pressur_bal
-            product_details['PL1'] = pl1
-            product_details['PackingSequence'] = packing_sequence
-
-        
-        
-        
-        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
-        context = {
-            'customer_data': customer_data if customer_data else {
-                'CustomerName': 'Not Available',
-                'CustomerPO': 'Not Available',
-                'CustomerCode': 'Not Available'
-            },
-            'product_details': product_details if product_details else {
-                'ItemType': 'Not Available',
-                'Subcode01': 'N/A',
-                'Subcode02': 'N/A',
-                'Subcode03': 'N/A',
-                'Subcode04': 'N/A',
-                'Subcode05': 'N/A',
-                'PressurBal': '',
-                'PL1': '',
-                'PackingSequence': ''
-            },
-            'kit_elements': kit_elements or [],
-            'production_order_code': production_order_code,
-            'production_demand_code': production_demand_code,
-            'pallet_number': pallet_number,
-            'box_number': box_number,
-            'packing_sequence': packing_sequence,
-            'MEDIA_URL': settings.MEDIA_URL
-        }
-
-        return render(request, 'view_data.html', context)
-
-    return render(request, 'fetch_data.html')
-from django.conf import settings
-from django.shortcuts import render, redirect
-from django.views.decorators.csrf import csrf_exempt
-from django.http import JsonResponse
-from .utils.db_queries import fetch_customer_data, fetch_product_details, fetch_kit_elements
-from .utils.db_queries import get_db_connection
 
 
 # ---------------------- HELPER: EXTRACT PRESSURBAL AND PL1 ----------------------
@@ -1562,137 +568,6 @@ def check_human_image_exists(human_folder_structure, element_desc):
     
     print(f"[HUMAN IMAGE NOT FOUND] {element_desc}")
     return None
-
-
-# ---------------------- FETCH ELEMENT DATA (NEW) ----------------------
-def get_element_data(request, element_id):
-    """Fetch element data and tolerance data from SKP_KITUPLOAD table"""
-    order_code = request.GET.get('order_code')
-    demand_code = request.GET.get('demand_code')
-    
-    if not order_code or not demand_code:
-        return JsonResponse({'status': 'error', 'message': 'Missing order or demand code'})
-    
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Fetch element data
-            cursor.execute("""
-                SELECT 
-                    LENGHT1, LENGHT2, WIDTH1, WIDTH2, THICKNESS,
-                    ROOTSIDEANGLEA2, TIPSIDEANGLEA1, TIPSIDEANGLEA2,
-                    ANGLEB1, ANGLEB2, ROOTSIDEANGLEC1, ROOTSIDEANGLEC2,
-                    TIPSIDEANGLEC1, TIPSIDEANGLEC2, T1, T2,
-                    TOLLENGHT1, TOLLENGHT2, TOLWIDTH1, TOLWIDTH2, TOLTHICKNESS,
-                    TOLROOTSIDEANGLEA2, TOLTIPSIDEANGLEA1, TOLTIPSIDEANGLEA2,
-                    TOLANGLEB1, TOLANGLEB2, TOLROOTSIDEANGLEC1, TOLROOTSIDEANGLEC2,
-                    TOLTIPSIDEANGLEC1, TOLTIPSIDEANGLEC2, TOLT1, TOLT2
-                FROM SKP_KITUPLOAD 
-                WHERE ELEMENTID = ? 
-                AND PRODUCTIONORDERCODE = ? 
-                AND PRODUCTIONDEMANDCODE = ?
-            """, [element_id, order_code, demand_code])
-            
-            row = cursor.fetchone()
-            cursor.close()
-            
-            if not row:
-                return JsonResponse({'status': 'error', 'message': 'Element not found'})
-            
-            # Map column names to values
-            columns = [
-                'LENGHT1', 'LENGHT2', 'WIDTH1', 'WIDTH2', 'THICKNESS',
-                'ROOTSIDEANGLEA2', 'TIPSIDEANGLEA1', 'TIPSIDEANGLEA2',
-                'ANGLEB1', 'ANGLEB2', 'ROOTSIDEANGLEC1', 'ROOTSIDEANGLEC2',
-                'TIPSIDEANGLEC1', 'TIPSIDEANGLEC2', 'T1', 'T2',
-                'TOLLENGHT1', 'TOLLENGHT2', 'TOLWIDTH1', 'TOLWIDTH2', 'TOLTHICKNESS',
-                'TOLROOTSIDEANGLEA2', 'TOLTIPSIDEANGLEA1', 'TOLTIPSIDEANGLEA2',
-                'TOLANGLEB1', 'TOLANGLEB2', 'TOLROOTSIDEANGLEC1', 'TOLROOTSIDEANGLEC2',
-                'TOLTIPSIDEANGLEC1', 'TOLTIPSIDEANGLEC2', 'TOLT1', 'TOLT2'
-            ]
-            
-            element_data = {}
-            tolerance_data = {}
-            
-            # Convert tuple to list for indexing
-            row_list = list(row)
-            
-            for i, col in enumerate(columns):
-                if i < 16:  # First 16 are element data
-                    element_data[col] = row_list[i]
-                else:  # Last 16 are tolerance data
-                    tolerance_data[col] = row_list[i]
-            
-            return JsonResponse({
-                'status': 'success',
-                'element_data': element_data,
-                'tolerance_data': tolerance_data
-            })
-            
-    except Exception as e:
-        print(f"Error fetching element data: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return JsonResponse({'status': 'error', 'message': str(e)})
-
-
-# ---------------------- SAVE ELEMENT DIMENSIONS (NEW) ----------------------
-@csrf_exempt
-def save_element_dimensions(request):
-    """Save dimension values to SKP_KITUPLOAD table"""
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': 'Method not allowed'})
-    
-    try:
-        data = json.loads(request.body)
-        element_id = data.get('element_id')
-        order_code = data.get('order_code')
-        demand_code = data.get('demand_code')
-        pallet_number = data.get('pallet_number')
-        box_number = data.get('box_number')
-        dimensions = data.get('dimensions', {})
-        
-        if not element_id or not order_code or not demand_code:
-            return JsonResponse({'status': 'error', 'message': 'Missing required fields'})
-        
-        if not dimensions:
-            return JsonResponse({'status': 'error', 'message': 'No dimensions to update'})
-        
-        # Build update query dynamically
-        update_fields = []
-        params = []
-        
-        for field, value in dimensions.items():
-            update_fields.append(f"{field} = ?")
-            params.append(value)
-        
-        # Add parameters for WHERE clause
-        params.extend([element_id, order_code, demand_code])
-        
-        query = f"""
-            UPDATE SKP_KITUPLOAD 
-            SET {', '.join(update_fields)}
-            WHERE ELEMENTID = ? 
-            AND PRODUCTIONORDERCODE = ? 
-            AND PRODUCTIONDEMANDCODE = ?
-        """
-        
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            conn.commit()
-            cursor.close()
-        
-        print(f"Dimensions updated for element {element_id}: {dimensions}")
-        
-        return JsonResponse({'status': 'success', 'message': 'Dimensions saved successfully'})
-        
-    except Exception as e:
-        print(f"Error saving dimensions: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return JsonResponse({'status': 'error', 'message': str(e)})
 
 
 # ---------------------- FETCH DATA ----------------------
@@ -2004,3 +879,1313 @@ def view_data(request):
         return render(request, 'view_data.html', context)
 
     return render(request, 'fetch_data.html')
+
+
+def write_timing_log(log_data):
+    """
+    Write timing information to a text file
+    """
+    # Create logs directory in project root
+    logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+    
+    # Ensure directory exists
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+        print(f"[LOG] Created logs directory at: {logs_dir}")
+    
+    # Create filename with current date
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    log_filename = f"capture_times_{today}.txt"
+    log_filepath = os.path.join(logs_dir, log_filename)
+    
+    # Get current timestamp
+    current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Calculate durations if timestamps are provided
+    
+    back_duration = log_data.get('back_capture_duration', 'N/A')
+    front_duration = log_data.get('front_capture_duration', 'N/A')
+    total_duration = log_data.get('total_duration', 'N/A')
+    between_duration = log_data.get('between_captures_duration', 'N/A')
+    upload_duration = log_data.get('upload_duration', 'N/A')
+    
+    # Format the log entry
+    log_entry = f"""
+{'='*80}
+TIMESTAMP: {current_time}
+{'='*80}
+
+ELEMENT INFORMATION:
+-------------------
+Element Description: {log_data.get('element_desc', 'N/A')}
+Image Type: {log_data.get('image_type', 'N/A')}
+Status: {log_data.get('status', 'N/A')}
+
+ORDER INFORMATION:
+-----------------
+Order Code: {log_data.get('order_code', 'N/A')}
+Demand Code: {log_data.get('demand_code', 'N/A')}
+
+CUSTOMER INFORMATION:
+--------------------
+Customer Name: {log_data.get('customer_name', 'N/A')}
+Customer PO: {log_data.get('customer_po', 'N/A')}
+
+CONTAINER INFORMATION:
+---------------------
+Pallet Number: {log_data.get('pallet_number', 'N/A')}
+Box Number: {log_data.get('box_number', 'N/A')}
+
+TIMING INFORMATION:
+------------------
+Capture Start Time: {log_data.get('capture_start_time', 'N/A')}
+Back Camera Capture: {log_data.get('back_capture_time', 'N/A')}
+Front Camera Capture: {log_data.get('front_capture_time', 'N/A')}
+Upload Start Time: {log_data.get('upload_start_time', 'N/A')}
+Upload Complete Time: {log_data.get('upload_complete_time', 'N/A')}
+
+DURATIONS (seconds):
+-------------------
+Total Duration (Start to Upload): {total_duration}
+Time to Back Camera Capture: {back_duration}
+Time to Front Camera Capture: {front_duration}
+Time Between Captures: {between_duration}
+Upload Processing Time: {upload_duration}
+
+SYSTEM INFORMATION:
+------------------
+Folder Path: {log_data.get('folder_path', 'N/A')}
+IP Address: {log_data.get('ip_address', 'N/A')}
+User Agent: {log_data.get('user_agent', 'N/A')[:100]}
+
+{'='*80}
+
+"""
+    
+    # Write to file
+    try:
+        with open(log_filepath, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
+        print(f"[LOG] Successfully wrote to: {log_filepath}")
+        return True
+    except Exception as e:
+        print(f"[LOG ERROR] Failed to write: {e}")
+        return False
+
+
+
+# ---------------------- SIMPLE LOG FUNCTION (DIRECT CALL) ----------------------
+def log_capture_time_simple(element_desc, order_code, demand_code, pallet_number, 
+                            box_number, capture_start, upload_complete, 
+                            status="success", extra_data=None):
+    """
+    Simple function to log capture time directly
+    """
+    logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+    
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    log_filepath = os.path.join(logs_dir, f"capture_times_{today}.txt")
+    
+    # Calculate duration
+    duration = "N/A"
+    if capture_start and upload_complete:
+        try:
+            start = datetime.datetime.fromisoformat(capture_start.replace('Z', '+00:00'))
+            end = datetime.datetime.fromisoformat(upload_complete.replace('Z', '+00:00'))
+            duration = f"{(end - start).total_seconds():.3f}"
+        except:
+            pass
+    
+    current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    log_entry = f"""
+[{current_time}] CAPTURE LOG
+Element: {element_desc}
+Order: {order_code} | Demand: {demand_code}
+Pallet: {pallet_number} | Box: {box_number}
+Capture Start: {capture_start}
+Upload Complete: {upload_complete}
+Total Duration: {duration} seconds
+Status: {status}
+{'='*60}
+"""
+    
+    if extra_data:
+        log_entry += f"Extra: {extra_data}\n{'='*60}\n"
+    
+    try:
+        with open(log_filepath, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
+        print(f"[SIMPLE LOG] Saved: {log_filepath}")
+        return True
+    except Exception as e:
+        print(f"[SIMPLE LOG ERROR] {e}")
+        return False
+
+
+def log_to_network_file(log_data):
+    """
+    Save timing logs directly to network path: \\192.168.4.32\Corekit\logs\
+    Creates folder automatically if it doesn't exist
+    """
+    # Network log path
+    network_base = r"\\192.168.4.32\Corekit"
+    logs_dir = os.path.join(network_base, "logs")
+    
+    # Create logs directory if it doesn't exist
+    try:
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir, exist_ok=True)
+            print(f"[LOG] Created logs directory: {logs_dir}")
+    except Exception as e:
+        print(f"[LOG ERROR] Could not create logs directory: {e}")
+        # Fallback to local logs if network fails
+        logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+    
+    # Create filename with date
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    log_filename = f"capture_upload_times_{today}.txt"
+    log_filepath = os.path.join(logs_dir, log_filename)
+    
+    # Current timestamp
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Format the log entry
+    log_entry = f"""
+{'='*80}
+[{timestamp}] IMAGE CAPTURE & UPLOAD LOG
+{'='*80}
+
+ELEMENT INFORMATION:
+-------------------
+Element Description: {log_data.get('element_desc', 'N/A')}
+Image Type: {log_data.get('image_type', 'N/A')}
+Status: {log_data.get('status', 'N/A')}
+
+ORDER INFORMATION:
+-----------------
+Order Code: {log_data.get('order_code', 'N/A')}
+Demand Code: {log_data.get('demand_code', 'N/A')}
+
+CUSTOMER INFORMATION:
+--------------------
+Customer Name: {log_data.get('customer_name', 'N/A')}
+Customer PO: {log_data.get('customer_po', 'N/A')}
+
+CONTAINER INFORMATION:
+---------------------
+Pallet Number: {log_data.get('pallet_number', 'N/A')}
+Box Number: {log_data.get('box_number', 'N/A')}
+
+TIME INFORMATION:
+----------------
+Capture Start Time: {log_data.get('capture_start_time', 'N/A')}
+Back Camera Capture: {log_data.get('back_capture_time', 'N/A')}
+Front Camera Capture: {log_data.get('front_capture_time', 'N/A')}
+Upload Start Time: {log_data.get('upload_start_time', 'N/A')}
+Upload Complete Time: {log_data.get('upload_complete_time', 'N/A')}
+
+DURATIONS (seconds):
+-------------------
+Total Duration (Start to Upload): {log_data.get('total_duration', 'N/A')}
+Time to Back Camera Capture: {log_data.get('back_capture_duration', 'N/A')}
+Time to Front Camera Capture: {log_data.get('front_capture_duration', 'N/A')}
+Time Between Captures: {log_data.get('between_captures_duration', 'N/A')}
+Upload Processing Time: {log_data.get('upload_duration', 'N/A')}
+
+SYSTEM INFORMATION:
+------------------
+Folder Path: {log_data.get('folder_path', 'N/A')}
+IP Address: {log_data.get('ip_address', 'N/A')}
+
+{'='*80}
+
+"""
+    
+    # Write to network log file
+    try:
+        with open(log_filepath, 'a', encoding='utf-8') as log_file:
+            log_file.write(log_entry)
+        print(f"[LOG] Successfully saved to: {log_filepath}")
+        return True
+    except Exception as e:
+        print(f"[LOG ERROR] Failed to write: {e}")
+        return False
+
+
+
+def log_simple_message(message, log_type="info"):
+    """Simple function to log quick messages to network"""
+    network_base = r"\\192.168.4.32\Corekit"
+    logs_dir = os.path.join(network_base, "logs")
+    
+    try:
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir, exist_ok=True)
+    except:
+        # Fallback to local
+        logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+    
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    log_filepath = os.path.join(logs_dir, f"simple_log_{today}.txt")
+    
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    
+    try:
+        with open(log_filepath, 'a', encoding='utf-8') as f:
+            f.write(f"[{timestamp}] [{log_type.upper()}] {message}\n")
+        return True
+    except Exception as e:
+        print(f"Simple log error: {e}")
+        return False
+
+
+# ---------------------- UPLOAD ELEMENT IMAGE ----------------------
+@csrf_exempt
+def upload_element_image(request):
+    if request.method == 'POST':
+        # Log start of upload
+        log_simple_message("upload_element_image called", "debug")
+        
+        try:
+            # Get timing information
+            capture_start_time = request.POST.get('capture_start_time')
+            back_capture_time = request.POST.get('back_capture_time')
+            front_capture_time = request.POST.get('front_capture_time')
+            upload_start_time = request.POST.get('upload_start_time')
+            
+            element_desc = request.POST.get('element_desc', '').strip()
+            is_human_image = request.POST.get('is_human_image') == 'true'
+            
+            # Get order information
+            production_order_code = request.POST.get('production_order_code', '').strip()
+            production_demand_code = request.POST.get('production_demand_code', '').strip()
+            pallet_number = request.POST.get('pallet_number', '').strip()
+            box_number = request.POST.get('box_number', '').strip()
+            
+            # Log basic info
+            log_simple_message(f"Processing: {element_desc} (Human: {is_human_image})", "info")
+            log_simple_message(f"Order: {production_order_code}, Demand: {production_demand_code}", "info")
+            log_simple_message(f"Capture start time: {capture_start_time}", "timing")
+            
+            # Set filename
+            if is_human_image:
+                filename = f"fc_{element_desc}.jpeg"
+            else:
+                filename = f"{element_desc}.jpeg"
+
+            image_data = request.POST.get('element_image')
+            
+            if not image_data:
+                log_simple_message("No image data received", "error")
+                return JsonResponse({'status': 'error', 'message': 'No image data'}, status=400)
+
+            # Dummy class for build_image_url
+            class Dummy:
+                def __init__(self, desc):
+                    self.desc = desc
+                def get(self, key, default):
+                    return self.desc if key == 'ELEMENTDESC' else default
+
+            dummy = Dummy(element_desc)
+
+            # Fetch data
+            from .utils.db_queries import fetch_customer_data, fetch_product_details, fetch_kit_elements
+            customer_data = fetch_customer_data(production_order_code, production_demand_code)
+            product_details = fetch_product_details(production_order_code, production_demand_code)
+            kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+
+            # Build folder structure
+            folder_structure, _ = build_image_url(
+                dummy,
+                customer_data or {},
+                product_details or {},
+                production_order_code,
+                production_demand_code,
+                pallet_number,
+                box_number,
+                kit_elements
+            )
+            
+            log_simple_message(f"Folder structure: {folder_structure}", "path")
+
+            image_bytes = base64.b64decode(image_data)
+
+            # Save the image
+            if is_human_image:
+                # Save only to network (no human_faces folder needed)
+                network_base = r"\\192.168.4.32\Corekit"
+                folder_structure_clean = folder_structure.strip('/\\')
+                network_folder = os.path.join(network_base, folder_structure_clean)
+                filepath = os.path.join(network_folder, filename)
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                
+                with open(filepath, 'wb') as f:
+                    f.write(image_bytes)
+                
+                log_simple_message(f"Human image saved to network: {filepath}", "success")
+            else:
+                # Save element image to local media
+                main_path = os.path.join(settings.MEDIA_ROOT, folder_structure)
+                os.makedirs(main_path, exist_ok=True)
+                filepath = os.path.join(main_path, filename)
+                
+                with open(filepath, 'wb') as f:
+                    f.write(image_bytes)
+                
+                log_simple_message(f"Element image saved to: {filepath}", "success")
+            
+            # LOG THE TIMING INFORMATION TO NETWORK
+            upload_complete_time = datetime.datetime.now().isoformat()
+            
+            # Get customer name and PO
+            customer_name = customer_data.get('CustomerName', 'UNKNOWN') if customer_data else 'UNKNOWN'
+            customer_po = customer_data.get('CustomerPO', 'NONE') if customer_data else 'NONE'
+            
+            # Extract PL value
+            pl_match = re.search(r'BOX_\d+_(\d+)', folder_structure)
+            pl_value = pl_match.group(1) if pl_match else '1'
+            
+            # Calculate durations
+            total_duration = "N/A"
+            back_capture_duration = "N/A"
+            front_capture_duration = "N/A"
+            between_captures_duration = "N/A"
+            upload_duration = "N/A"
+            
+            if capture_start_time and upload_complete_time:
+                try:
+                    start = datetime.datetime.fromisoformat(capture_start_time.replace('Z', '+00:00'))
+                    end = datetime.datetime.fromisoformat(upload_complete_time.replace('Z', '+00:00'))
+                    total_duration = f"{(end - start).total_seconds():.3f}"
+                    log_simple_message(f"Total duration for {element_desc}: {total_duration} seconds", "duration")
+                except Exception as e:
+                    log_simple_message(f"Could not calculate total duration: {e}", "warning")
+            
+            if capture_start_time and back_capture_time:
+                try:
+                    start = datetime.datetime.fromisoformat(capture_start_time.replace('Z', '+00:00'))
+                    back = datetime.datetime.fromisoformat(back_capture_time.replace('Z', '+00:00'))
+                    back_capture_duration = f"{(back - start).total_seconds():.3f}"
+                except:
+                    pass
+            
+            if capture_start_time and front_capture_time:
+                try:
+                    start = datetime.datetime.fromisoformat(capture_start_time.replace('Z', '+00:00'))
+                    front = datetime.datetime.fromisoformat(front_capture_time.replace('Z', '+00:00'))
+                    front_capture_duration = f"{(front - start).total_seconds():.3f}"
+                except:
+                    pass
+            
+            if back_capture_time and front_capture_time:
+                try:
+                    back = datetime.datetime.fromisoformat(back_capture_time.replace('Z', '+00:00'))
+                    front = datetime.datetime.fromisoformat(front_capture_time.replace('Z', '+00:00'))
+                    between_captures_duration = f"{abs((front - back).total_seconds()):.3f}"
+                except:
+                    pass
+            
+            if upload_start_time and upload_complete_time:
+                try:
+                    up_start = datetime.datetime.fromisoformat(upload_start_time.replace('Z', '+00:00'))
+                    up_end = datetime.datetime.fromisoformat(upload_complete_time.replace('Z', '+00:00'))
+                    upload_duration = f"{(up_end - up_start).total_seconds():.3f}"
+                except:
+                    pass
+            
+            # Prepare log data for network storage
+            log_data = {
+                'element_desc': element_desc,
+                'image_type': 'Human Image' if is_human_image else 'Element Image',
+                'status': 'success',
+                'order_code': production_order_code,
+                'demand_code': production_demand_code,
+                'customer_name': customer_name,
+                'customer_po': customer_po,
+                'pallet_number': pallet_number,
+                'box_number': box_number,
+                'pl_value': pl_value,
+                'capture_start_time': capture_start_time,
+                'back_capture_time': back_capture_time,
+                'front_capture_time': front_capture_time,
+                'upload_start_time': upload_start_time,
+                'upload_complete_time': upload_complete_time,
+                'total_duration': total_duration,
+                'back_capture_duration': back_capture_duration,
+                'front_capture_duration': front_capture_duration,
+                'between_captures_duration': between_captures_duration,
+                'upload_duration': upload_duration,
+                'folder_path': folder_structure,
+                'ip_address': request.META.get('REMOTE_ADDR', 'N/A')
+            }
+            
+            # Save to network log file
+            log_to_network_file(log_data)
+            
+            return JsonResponse({
+                'status': 'success',
+                'filename': filename,
+                'path': str(filepath),
+                'message': 'Image saved successfully',
+                'total_duration': total_duration,
+                'log_saved_to': r'\\192.168.4.32\Corekit\logs'
+            })
+
+        except Exception as e:
+            error_msg = f"Upload error: {str(e)}"
+            log_simple_message(error_msg, "error")
+            import traceback
+            traceback.print_exc()
+            
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+    return JsonResponse({'status': 'error', 'message': 'Invalid request method'}, status=405)
+
+
+
+# ---------------------- DELETE IMAGE ----------------------
+@csrf_exempt
+def delete_element_image(request):
+    if request.method == 'POST':
+        try:
+            image_url = request.POST.get('image_url', '').strip()
+            is_human_image = request.POST.get('is_human_image') == 'true'
+            element_desc = request.POST.get('element_desc', '').strip()
+            production_order_code = request.POST.get('production_order_code', '').strip()
+            production_demand_code = request.POST.get('production_demand_code', '').strip()
+            pallet_number = request.POST.get('pallet_number', '').strip()
+            box_number = request.POST.get('box_number', '').strip()
+            
+            if not element_desc:
+                return JsonResponse({'status': 'error', 'message': 'Element description is required'}, status=400)
+            
+            class Dummy:
+                def __init__(self, desc):
+                    self.desc = desc
+                def get(self, key, default):
+                    return self.desc if key == 'ELEMENTDESC' else default
+            
+            dummy = Dummy(element_desc)
+            
+            customer_data = fetch_customer_data(production_order_code, production_demand_code)
+            product_details = fetch_product_details(production_order_code, production_demand_code)
+            kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+            
+            folder_structure, _ = build_image_url(
+                dummy,
+                customer_data or {},
+                product_details or {},
+                production_order_code,
+                production_demand_code,
+                pallet_number,
+                box_number,
+                kit_elements
+            )
+            
+            deleted_files = []
+            failed_files = []
+            
+            # Delete element image (local only)
+            element_filename = f"{element_desc}.jpeg"
+            main_folder = os.path.join(settings.MEDIA_ROOT, folder_structure)
+            element_file_path = os.path.join(main_folder, element_filename)
+            
+            if os.path.exists(element_file_path):
+                try:
+                    os.remove(element_file_path)
+                    deleted_files.append(f"Element image: {element_filename}")
+                except Exception as e:
+                    failed_files.append(f"Element image: {str(e)}")
+            
+            # Delete human image from network only
+            human_filename = f"fc_{element_desc}.jpeg"
+            try:
+                network_base = r"\\192.168.4.32\Corekit"
+                folder_structure_clean = folder_structure.strip('/\\')
+                network_folder = os.path.join(network_base, folder_structure_clean)
+                network_file_path = os.path.join(network_folder, human_filename)
+                
+                if os.path.exists(network_file_path):
+                    os.remove(network_file_path)
+                    deleted_files.append(f"Human image (network): {human_filename}")
+            except Exception as e:
+                print(f"Error deleting network human image: {e}")
+                failed_files.append(f"Human image (network): {str(e)}")
+            
+            # Log deletion time
+            deletion_time = datetime.datetime.now()
+            logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+            os.makedirs(logs_dir, exist_ok=True)
+            today = datetime.datetime.now().strftime('%Y-%m-%d')
+            log_filename = f"image_deletions_{today}.txt"
+            log_filepath = os.path.join(logs_dir, log_filename)
+            
+            with open(log_filepath, 'a', encoding='utf-8') as log_file:
+                log_file.write(f"""
+{'='*80}
+[{deletion_time.strftime('%Y-%m-%d %H:%M:%S')}] IMAGE DELETION
+{'='*80}
+Element: {element_desc}
+Order: {production_order_code}
+Demand: {production_demand_code}
+Pallet: {pallet_number}
+Box: {box_number}
+Deleted Files: {', '.join(deleted_files)}
+Failed: {', '.join(failed_files)}
+{'='*80}
+
+""")
+            
+            if deleted_files:
+                message = f"Successfully deleted: {', '.join(deleted_files)}"
+                if failed_files:
+                    message += f" | Failed: {', '.join(failed_files)}"
+                return JsonResponse({
+                    'status': 'success', 
+                    'message': message,
+                    'deleted_files': deleted_files,
+                    'failed_files': failed_files
+                })
+            else:
+                return JsonResponse({
+                    'status': 'error', 
+                    'message': 'No images found to delete'
+                }, status=404)
+                
+        except Exception as e:
+            print(f"Delete image error: {e}")
+            import traceback
+            traceback.print_exc()
+            return JsonResponse({
+                'status': 'error', 
+                'message': f'Server error: {str(e)}'
+            }, status=500)
+
+    return JsonResponse({'status': 'error', 'message': 'Invalid request method'}, status=405)
+
+
+
+@csrf_exempt
+def save_timing_log_endpoint(request):
+    """Endpoint to save timing log from frontend"""
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            
+            # Prepare log data
+            log_data = {
+                'element_desc': data.get('element_desc', 'N/A'),
+                'image_type': data.get('image_type', 'N/A'),
+                'status': data.get('status', 'N/A'),
+                'order_code': data.get('order_code', 'N/A'),
+                'demand_code': data.get('demand_code', 'N/A'),
+                'customer_name': data.get('customer_name', 'N/A'),
+                'customer_po': data.get('customer_po', 'N/A'),
+                'pallet_number': data.get('pallet_number', 'N/A'),
+                'box_number': data.get('box_number', 'N/A'),
+                'pl_value': data.get('pl_value', 'N/A'),
+                'capture_start_time': data.get('capture_start_time', 'N/A'),
+                'back_capture_time': data.get('back_capture_time', 'N/A'),
+                'front_capture_time': data.get('front_capture_time', 'N/A'),
+                'upload_start_time': data.get('upload_start_time', 'N/A'),
+                'upload_complete_time': data.get('upload_complete_time', 'N/A'),
+                'total_duration': data.get('total_duration', 'N/A'),
+                'back_capture_duration': data.get('back_capture_duration', 'N/A'),
+                'front_capture_duration': data.get('front_capture_duration', 'N/A'),
+                'between_captures_duration': data.get('between_captures_duration', 'N/A'),
+                'upload_duration': data.get('upload_duration', 'N/A'),
+                'folder_path': data.get('folder_path', 'N/A'),
+                'ip_address': request.META.get('REMOTE_ADDR', 'N/A'),
+                'user_agent': request.META.get('HTTP_USER_AGENT', 'N/A')[:100]
+            }
+            
+            # Save to text file
+            log_time_to_text_file(log_data)
+            
+            return JsonResponse({'status': 'success', 'message': 'Log saved successfully'})
+        except Exception as e:
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+    
+    return JsonResponse({'status': 'error', 'message': 'Invalid method'}, status=405)
+
+
+
+@csrf_exempt
+def test_network_logging(request):
+    """Test endpoint to verify network logging is working"""
+    if request.method == 'GET':
+        try:
+            # Test simple log
+            log_simple_message("=== TEST LOG - Network logging test ===", "test")
+            
+            # Test detailed log
+            test_data = {
+                'element_desc': 'TEST_IMAGE',
+                'image_type': 'Test',
+                'status': 'test',
+                'order_code': 'TEST_ORDER',
+                'demand_code': 'TEST_DEMAND',
+                'customer_name': 'TEST_CUSTOMER',
+                'customer_po': 'TEST_PO',
+                'pallet_number': '1',
+                'box_number': '1',
+                'pl_value': '1',
+                'capture_start_time': datetime.datetime.now().isoformat(),
+                'upload_complete_time': datetime.datetime.now().isoformat(),
+                'total_duration': '0.001',
+                'folder_path': 'TEST_FOLDER',
+                'ip_address': request.META.get('REMOTE_ADDR', 'N/A')
+            }
+            
+            result = log_to_network_file(test_data)
+            
+            if result:
+                return JsonResponse({
+                    'status': 'success',
+                    'message': 'Network logging test successful',
+                    'log_path': r'\\192.168.4.32\Corekit\logs'
+                })
+            else:
+                return JsonResponse({
+                    'status': 'error',
+                    'message': 'Failed to write to network log'
+                }, status=500)
+                
+        except Exception as e:
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+    
+    return JsonResponse({'status': 'error', 'message': 'Use GET request'}, status=405)
+
+
+
+# ---------------------- VIEW ALL LOGS ENDPOINT ----------------------
+def view_logs(request):
+    """View to display all log files from network"""
+    network_base = r"\\192.168.4.32\Corekit"
+    logs_dir = os.path.join(network_base, "logs")
+    
+    log_files = []
+    if os.path.exists(logs_dir):
+        log_files = [f for f in os.listdir(logs_dir) if f.endswith('.txt')]
+        log_files.sort(reverse=True)
+    
+    return JsonResponse({
+        'log_directory': logs_dir,
+        'log_files': log_files,
+        'total_logs': len(log_files)
+    })
+    
+    
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+from django.views.decorators.csrf import csrf_protect
+from datetime import datetime
+import os, base64
+
+
+# BOX_IMAGE_PATH = (
+#     r"D:\OneDrive - SKAPS INDUSTRIES INDIA PVT.LTD\Jay Vyas's files - Images from Server"
+#     # r"D:\OneDrive - SKAPS INDUSTRIES INDIA PVT.LTD"
+#     # r"\Jay Vyas's files - Extracted"
+#     # r"\Server_Response_Box_img"
+# )
+
+BOX_IMAGE_PATH = os.path.join(settings.MEDIA_ROOT, "box_images")
+
+
+
+
+@require_POST
+@csrf_protect
+def upload_box_capture(request):
+
+    try:
+
+        # --------------------------------------------------
+        # Get image
+        # ---------------------------------------------------
+
+        image_data = request.POST.get("box_image")
+
+        if not image_data:
+
+            return JsonResponse({
+                "status": "error",
+                "message": "No image received."
+            })
+
+
+        # --------------------------------------------------
+        # Get order information
+        # --------------------------------------------------
+
+        production_order_code = (
+            request.POST.get(
+                "production_order_code",
+                "UNKNOWN_ORDER"
+            )
+        )
+
+        production_demand_code = (
+            request.POST.get(
+                "production_demand_code",
+                "UNKNOWN_DEMAND"
+            )
+        )
+
+        pallet_number = (
+            request.POST.get(
+                "pallet_number",
+                "UNKNOWN_PALLET"
+            )
+        )
+
+        box_number = (
+            request.POST.get(
+                "box_number",
+                "UNKNOWN_BOX"
+            )
+        )
+
+
+        # --------------------------------------------------
+        # Create folder if it doesn't exist
+        # --------------------------------------------------
+
+        os.makedirs(
+            BOX_IMAGE_PATH,
+            exist_ok=True
+        )
+
+
+        # --------------------------------------------------
+        # Remove base64 prefix if present
+        # --------------------------------------------------
+
+        if "," in image_data:
+
+            image_data = image_data.split(
+                ",",
+                1
+            )[1]
+
+
+        # --------------------------------------------------
+        # Decode image
+        # --------------------------------------------------
+
+        image_bytes = base64.b64decode(
+            image_data
+        )
+
+
+        # --------------------------------------------------
+        # Create filename
+        # --------------------------------------------------
+
+        timestamp = datetime.now().strftime(
+            "%Y%m%d_%H%M%S_%f"
+        )
+
+
+        filename = (
+            f"{production_order_code}_"
+            f"{production_demand_code}_"
+            f"Pallet_{pallet_number}_"
+            f"Box_{box_number}_"
+            f"{timestamp}.jpg"
+        )
+
+
+        # Remove invalid Windows filename characters
+        invalid_chars = '<>:"/\\|?*'
+
+
+        for char in invalid_chars:
+
+            filename = filename.replace(
+                char,
+                "_"
+            )
+
+
+        # --------------------------------------------------
+        # Full path
+        # --------------------------------------------------
+
+        file_path = os.path.join(
+            BOX_IMAGE_PATH,
+            filename
+        )
+
+
+        # --------------------------------------------------
+        # Save image
+        # --------------------------------------------------
+
+        with open(
+            file_path,
+            "wb"
+        ) as image_file:
+
+            image_file.write(
+                image_bytes
+            )
+
+
+        print(
+            "✅ Box image saved:",
+            file_path
+        )
+
+
+        # --------------------------------------------------
+        # Response
+        # --------------------------------------------------
+
+        return JsonResponse({
+
+            "status": "success",
+
+            "message":
+                "Box image uploaded successfully.",
+
+            "filepath":
+                file_path,
+
+            "filename":
+                filename
+        })
+
+
+    except Exception as e:
+
+        print(
+            "❌ Box image upload error:",
+            str(e)
+        )
+
+
+        return JsonResponse({
+
+            "status": "error",
+
+            "message":
+                str(e)
+
+        }, status=500)
+        
+        
+        
+        
+# import os
+# import shutil
+# from django.conf import settings
+
+# SOURCE_DIR = r"E:\Onedrive_it_intern\OneDrive - SKAPS INDUSTRIES INDIA PVT.LTD\Jay Vyas's files - Images from Server"
+# DEST_DIR = r"\\192.168.4.32\Corekit"
+
+# def move_files(production_order_code, production_demand_code, pallet_number, box_number, ply_orders):
+#     # Step 1: Query database for ply_id → order_number mapping
+#     order_clean = production_order_code.strip().upper()
+#     demand_clean = production_demand_code.strip().upper()
+#     pallet_clean = str(pallet_number).strip().upper()
+#     box_clean = str(box_number).strip().upper()
+#     mapping = {po.ply_id: po.order_number for po in ply_orders}
+
+#     # Step 2: Loop through files in source
+#     for filename in os.listdir(SOURCE_DIR):
+#         if filename.endswith(".txt"):
+#             # Extract ply_id from filename (assuming format Sl145.txt)
+#             ply_id = filename.replace(".txt", "")
+
+#             if ply_id in mapping:
+#                 order_number = mapping[ply_id]
+
+#                 # Step 3: Build destination folder path
+#                 dest_folder = os.path.join(DEST_DIR, ply_id)
+
+#                 if not os.path.exists(dest_folder):
+#                     os.makedirs(dest_folder)
+
+#                 # Step 4: Move file
+#                 src_path = os.path.join(SOURCE_DIR, filename)
+#                 dest_path = os.path.join(dest_folder, filename)
+#                 shutil.move(src_path, dest_path)
+
+#                 print(f"Moved {filename} for Ply {ply_id} (Order {order_number})")
+#             else:
+#                 print(f"No order found for {ply_id}, skipping {filename}")
+
+
+import os
+import shutil
+import re
+import time
+import logging
+from pathlib import Path
+from datetime import datetime
+# import watchdog.observers import Observer
+# import watchdog.events import FileSystemEventHandler
+from django.conf import settings
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class TextFileHandler(FileSystemEventHandler):
+    """Handler for processing .txt files and moving them to appropriate ply folders."""
+    
+    def __init__(self, source_dir, base_destination_dir, order_number):
+        """
+        Initialize the file handler.
+        
+        Args:
+            source_dir: Directory to watch for new .txt files
+            base_destination_dir: Base directory containing ply folders
+            order_number: The production order number to match
+        """
+        self.source_dir = Path(source_dir)
+        self.base_dest_dir = Path(base_destination_dir)
+        self.order_number = order_number
+        self.processed_files = set()  # Track processed files to avoid duplicates
+        
+    def on_created(self, event):
+        """Handle new file creation events."""
+        if not event.is_directory and event.src_path.endswith('.txt'):
+            self.process_file(event.src_path)
+    
+    def on_moved(self, event):
+        """Handle file move events."""
+        if not event.is_directory and event.dest_path.endswith('.txt'):
+            self.process_file(event.dest_path)
+    
+    def process_file(self, file_path):
+        """Process a single .txt file and move it to the appropriate folder."""
+        file_path = Path(file_path)
+        
+        # Skip if already processed
+        if str(file_path) in self.processed_files:
+            return
+        
+        try:
+            # Extract ply ID and sequence from filename
+            filename = file_path.name
+            ply_id, sequence = self.extract_ply_info(filename)
+            
+            if not ply_id:
+                logger.warning(f"Could not extract ply ID from: {filename}")
+                return
+            
+            # Find the destination folder
+            dest_folder = self.find_destination_folder(ply_id)
+            
+            if not dest_folder:
+                logger.warning(f"No destination folder found for ply ID: {ply_id}")
+                return
+            
+            # Create destination folder if it doesn't exist
+            dest_folder.mkdir(parents=True, exist_ok=True)
+            
+            # Move the file
+            dest_path = dest_folder / filename
+            
+            # Check if file already exists
+            if dest_path.exists():
+                logger.warning(f"File already exists: {dest_path}")
+                # Rename with timestamp
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                new_name = f"{Path(filename).stem}_{timestamp}.txt"
+                dest_path = dest_folder / new_name
+                logger.info(f"Renaming to: {new_name}")
+            
+            # Move the file
+            shutil.move(str(file_path), str(dest_path))
+            self.processed_files.add(str(file_path))
+            logger.info(f"✓ Moved {filename} to {dest_folder.name}")
+            
+            # Log the move to database if needed
+            self.log_file_move(filename, ply_id, str(dest_folder))
+            
+        except Exception as e:
+            logger.error(f"Error processing file {file_path}: {str(e)}")
+    
+    def extract_ply_info(self, filename):
+        """
+        Extract ply ID and sequence from filename.
+        
+        Expected format: PLYID_SEQUENCE.txt or PLYID_ORDERNUMBER_SEQUENCE.txt
+        Examples: SL145_001.txt, SL145_ORD123_001.txt, SL145.txt
+        """
+        # Remove extension
+        name = Path(filename).stem
+        
+        # Try multiple patterns
+        patterns = [
+            # Pattern 1: PLYID_ORDERNUMBER_SEQUENCE (e.g., SL145_ORD123_001)
+            rf'^([A-Za-z0-9]+)_{re.escape(self.order_number)}_(\d+)$',
+            # Pattern 2: PLYID_SEQUENCE (e.g., SL145_001)
+            r'^([A-Za-z0-9]+)_(\d+)$',
+            # Pattern 3: PLYID (e.g., SL145)
+            r'^([A-Za-z0-9]+)$',
+            # Pattern 4: PLYID_ (e.g., SL145_)
+            r'^([A-Za-z0-9]+)_',
+        ]
+        
+        for pattern in patterns:
+            match = re.match(pattern, name)
+            if match:
+                if len(match.groups()) == 2:
+                    return match.group(1), match.group(2)
+                else:
+                    return match.group(1), None
+        
+        # Special case: Check if filename contains order number
+        if self.order_number in name:
+            parts = name.split('_')
+            if len(parts) >= 1:
+                return parts[0], parts[1] if len(parts) > 1 else None
+        
+        return None, None
+    
+    def find_destination_folder(self, ply_id):
+        """
+        Find the destination folder for a given ply ID.
+        
+        The folder should contain the ply ID in its name and the order number.
+        """
+        # Search for folders containing the ply ID and order number
+        matches = []
+        
+        # Pattern 1: *PLYID*ORDERNUMBER* (most specific)
+        pattern1 = f"*{ply_id}*{self.order_number}*"
+        matches.extend(self.base_dest_dir.glob(pattern1))
+        
+        # Pattern 2: *PLYID* (less specific)
+        if not matches:
+            pattern2 = f"*{ply_id}*"
+            matches.extend(self.base_dest_dir.glob(pattern2))
+        
+        # Pattern 3: Case-insensitive search
+        if not matches:
+            for folder in self.base_dest_dir.iterdir():
+                if folder.is_dir():
+                    folder_name = folder.name.upper()
+                    if ply_id.upper() in folder_name and self.order_number.upper() in folder_name:
+                        matches.append(folder)
+            
+            if not matches:
+                # Try just ply ID case-insensitive
+                for folder in self.base_dest_dir.iterdir():
+                    if folder.is_dir() and ply_id.upper() in folder.name.upper():
+                        matches.append(folder)
+        
+        # If multiple matches, use the most specific one
+        if matches:
+            # Sort by length (most specific first)
+            matches.sort(key=lambda x: len(x.name), reverse=True)
+            return matches[0]
+        
+        return None
+    
+    def log_file_move(self, filename, ply_id, dest_folder):
+        """Log file move information (optional - can be extended to save to database)."""
+        # You can extend this to save to your database
+        # Example: FileMoveLog.objects.create(
+        #     filename=filename,
+        #     ply_id=ply_id,
+        #     destination_folder=dest_folder,
+        #     moved_at=datetime.now()
+        # )
+        pass
+
+
+def process_existing_files(source_dir, base_destination_dir, order_number):
+    """Process all existing .txt files in the source directory."""
+    handler = TextFileHandler(source_dir, base_destination_dir, order_number)
+    source_path = Path(source_dir)
+    
+    # Find all .txt files
+    txt_files = list(source_path.glob('*.txt'))
+    
+    if not txt_files:
+        logger.info("No existing .txt files found in source directory")
+        return
+    
+    logger.info(f"Processing {len(txt_files)} existing .txt files...")
+    
+    for file_path in txt_files:
+        handler.process_file(str(file_path))
+
+
+def watch_directory(source_dir, base_destination_dir, order_number, process_existing=True):
+    """
+    Watch a directory for new .txt files and move them to appropriate folders.
+    
+    Args:
+        source_dir: Directory to watch for new .txt files
+        base_destination_dir: Base directory containing ply folders
+        order_number: The production order number to match
+        process_existing: Whether to process existing files on start
+    """
+    # Validate directories
+    source_path = Path(source_dir)
+    dest_path = Path(base_destination_dir)
+    
+    if not source_path.exists():
+        raise ValueError(f"Source directory does not exist: {source_dir}")
+    
+    if not dest_path.exists():
+        raise ValueError(f"Destination directory does not exist: {base_destination_dir}")
+    
+    # Process existing files if requested
+    if process_existing:
+        process_existing_files(source_dir, base_destination_dir, order_number)
+    
+    # Set up file watcher
+    event_handler = TextFileHandler(source_dir, base_destination_dir, order_number)
+    observer = Observer()
+    observer.schedule(event_handler, source_dir, recursive=False)
+    
+    logger.info("=" * 60)
+    logger.info(f"📁 Watching directory: {source_dir}")
+    logger.info(f"📂 Destination directory: {base_destination_dir}")
+    logger.info(f"🔢 Order number: {order_number}")
+    logger.info("Press Ctrl+C to stop watching...")
+    logger.info("=" * 60)
+    
+    try:
+        observer.start()
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+        logger.info("Stopping file watcher...")
+    
+    observer.join()
+
+
+def move_txt_files_once(source_dir, base_destination_dir, order_number):
+    """
+    One-time move of .txt files from source directory to matching ply folders.
+    
+    Args:
+        source_dir: Directory containing .txt files
+        base_destination_dir: Base directory with ply folders
+        order_number: Production order number to match
+    """
+    source_path = Path(source_dir)
+    dest_path = Path(base_destination_dir)
+    
+    if not source_path.exists():
+        logger.error(f"Source directory not found: {source_dir}")
+        return False
+    
+    if not dest_path.exists():
+        logger.error(f"Destination directory not found: {base_destination_dir}")
+        return False
+    
+    # Find all .txt files
+    txt_files = list(source_path.glob('*.txt'))
+    
+    if not txt_files:
+        logger.info("No .txt files found")
+        return True
+    
+    logger.info(f"Found {len(txt_files)} .txt files")
+    
+    moved_count = 0
+    failed_count = 0
+    
+    for file_path in txt_files:
+        filename = file_path.name
+        
+        # Extract ply ID from filename
+        name = file_path.stem  # Remove extension
+        
+        # Try to extract ply ID
+        match = re.match(r'^([A-Za-z0-9]+)', name)
+        if not match:
+            logger.warning(f"Could not extract ply ID from: {filename}")
+            failed_count += 1
+            continue
+        
+        ply_id = match.group(1)
+        
+        # Find destination folder
+        found_folders = []
+        
+        # Look for folder containing both ply_id and order_number
+        for folder in dest_path.iterdir():
+            if folder.is_dir():
+                folder_name = folder.name.upper()
+                if ply_id.upper() in folder_name and order_number.upper() in folder_name:
+                    found_folders.append(folder)
+        
+        # If not found with order number, try just the ply ID
+        if not found_folders:
+            for folder in dest_path.iterdir():
+                if folder.is_dir() and ply_id.upper() in folder.name.upper():
+                    found_folders.append(folder)
+        
+        if not found_folders:
+            logger.warning(f"No destination folder found for ply: {ply_id}")
+            failed_count += 1
+            continue
+        
+        # Use the most specific match
+        dest_folder = sorted(found_folders, key=lambda x: len(x.name), reverse=True)[0]
+        
+        # Create destination folder if it doesn't exist
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        
+        dest_path_full = dest_folder / filename
+        
+        # Move the file
+        try:
+            if dest_path_full.exists():
+                # Rename with timestamp
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                new_name = f"{Path(filename).stem}_{timestamp}.txt"
+                dest_path_full = dest_folder / new_name
+                logger.info(f"File exists, renaming to: {new_name}")
+            
+            shutil.move(str(file_path), str(dest_path_full))
+            moved_count += 1
+            logger.info(f"✓ Moved: {filename} -> {dest_folder.name}")
+        except Exception as e:
+            logger.error(f"Error moving {filename}: {str(e)}")
+            failed_count += 1
+    
+    logger.info("=" * 60)
+    logger.info(f"✅ Successfully moved: {moved_count} files")
+    logger.info(f"❌ Failed: {failed_count} files")
+    logger.info("=" * 60)
+    
+    return True
+
+
+# # Django integration helper
+# def get_file_paths_from_django():
+#     """Get file paths from Django settings."""
+#     from django.conf import settings
+    
+#     # You can add these to your settings.py
+#     source_dir = getattr(settings, 'PLY_FILE_SOURCE_DIR', '/tmp/ply_files')
+#     dest_dir = getattr(settings, 'PLY_FILE_DEST_DIR', '/media/ply_folders')
+#     order_number = getattr(settings, 'CURRENT_ORDER_NUMBER', 'ORD123')
+    
+#     return source_dir, dest_dir, order_number
+
+
+        
+        
